@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Usage"
+  short_description: "Check Codex usage windows"
+  default_prompt: "Use $codex-usage to show my current Codex 5h and weekly usage windows."
