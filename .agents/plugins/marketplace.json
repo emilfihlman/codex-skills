@@ -1,14 +1,14 @@
 {
-  "name": "emil-codex-skills",
+  "name": "emilfihlman",
   "interface": {
-    "displayName": "Emil Codex Skills"
+    "displayName": "Emil Fihlman"
   },
   "plugins": [
     {
-      "name": "codex-skills",
+      "name": "usage",
       "source": {
         "source": "local",
-        "path": "./plugins/codex-skills"
+        "path": "./plugins/usage"
       },
       "policy": {
         "installation": "AVAILABLE",

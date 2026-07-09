@@ -1,9 +1,9 @@
 ---
-name: codex-usage-forecast
+name: codex-forecast
 description: Forecast when Codex ChatGPT-plan usage may run out by polling backend usage from the codex-usage helper and writing readable forecast files. Use when the user asks to predict 5-hour or weekly Codex exhaustion, run a minute-by-minute usage monitor, read usage forecast state, or inspect forecast telemetry for other automation.
 ---
 
-# Codex Usage Forecast
+# Codex Forecast
 
 Use this skill for forecasting and telemetry only. Keep simple current usage checks in `$codex-usage`; use this skill when prediction, polling, or forecast files are needed. Do not use this skill to add slowdown behavior, work-style policy, mandatory waits, subagent limits, or conservation instructions unless the user explicitly asks for that separate judgment.
 

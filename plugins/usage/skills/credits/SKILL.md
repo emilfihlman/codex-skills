@@ -1,9 +1,9 @@
 ---
-name: codex-reset-credits
+name: credits
 description: Query and summarize ChatGPT/Codex banked rate-limit reset credits from the local Codex ChatGPT login. Use when the user asks to check Codex usage reset tokens, reset-credit expiry times, available Codex rate-limit resets, or the internal reset-credit metadata without redeeming a token.
 ---
 
-# Codex Reset Credits
+# Usage Credits
 
 Use this skill to inspect banked Codex rate-limit reset credits without redeeming them. The bundled script reads the local Codex auth cache, calls the ChatGPT reset-credit endpoint, and summarizes availability and expiry.
 

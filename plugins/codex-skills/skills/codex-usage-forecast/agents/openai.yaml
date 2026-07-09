@@ -1,4 +1,0 @@
-interface:
-  display_name: "Codex Usage Forecast"
-  short_description: "Forecast Codex usage exhaustion"
-  default_prompt: "Use $codex-usage-forecast to forecast my Codex 5h and weekly usage windows and report the forecast telemetry. Do not add usage-conservation or work-style instructions unless I explicitly ask for that separate analysis."

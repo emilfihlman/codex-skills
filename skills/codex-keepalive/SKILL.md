@@ -5,7 +5,7 @@ description: Keep active Codex goals resumable across usage limits by persistent
 
 # Codex Keepalive
 
-Use this skill only for screen-based `/goal resume` sending. Usage polling and prediction live in `$codex-usage-forecast`; this skill reads that forecast and wakes existing interactive Codex sessions.
+Use this skill only for screen-based `/goal resume` sending. Usage polling and prediction live in `$codex-forecast`; this skill reads that forecast and wakes existing interactive Codex sessions.
 
 When this skill is used for an active Codex goal:
 

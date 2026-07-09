@@ -1,5 +1,5 @@
 {
-  "name": "codex-skills",
+  "name": "usage",
   "version": "0.1.0",
   "description": "Codex usage inspection, usage forecasting, reset-credit inspection, and goal keepalive skills.",
   "author": {
@@ -17,7 +17,7 @@
   ],
   "skills": "./skills/",
   "interface": {
-    "displayName": "Codex Skills",
+    "displayName": "Usage",
     "shortDescription": "Usage, reset-credit, forecast, and keepalive helpers for Codex.",
     "longDescription": "A small skill-only Codex plugin for checking ChatGPT-plan Codex usage, inspecting reset credits, forecasting usage exhaustion, and keeping interactive GNU Screen-backed goals resumable after usage limits clear.",
     "developerName": "Emil Fihlman",

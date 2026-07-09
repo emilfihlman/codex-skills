@@ -1,0 +1,4 @@
+interface:
+  display_name: "Usage Credits"
+  short_description: "Inspect Codex reset-credit expiry"
+  default_prompt: "Use $usage:credits to check my available Codex reset credits and expiry times."
