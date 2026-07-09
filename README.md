@@ -2,6 +2,10 @@
 
 Personal Codex skills for usage inspection, usage forecasting, reset-credit inspection, and goal keepalive automation.
 
+## Warning
+
+These skills call internal ChatGPT/Codex backend endpoints through the local Codex ChatGPT login. They may stop working if those internal endpoints, response shapes, or local authentication files change. The scripts avoid printing access tokens, but treat `~/.codex/auth.json` and raw endpoint responses as sensitive.
+
 ## Plugin Install
 
 Install the bundled plugin when you want short names:
@@ -52,4 +56,10 @@ This repository is a Codex plugin marketplace:
 - `plugins/usage/skills/<skill-name>/`: plugin-bundled skills.
 - `skills/<skill-name>/`: standalone skill copies.
 
-These skills call internal ChatGPT/Codex backend endpoints through the local Codex ChatGPT login. Treat endpoint failures as possible auth, rollout, or endpoint changes.
+## Checks
+
+Run the package check before publishing or tagging:
+
+```bash
+scripts/check-package.sh
+```
