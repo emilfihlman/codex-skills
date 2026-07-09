@@ -38,6 +38,7 @@ check_executable() {
 need jq
 need sed
 need cmp
+need mktemp
 
 jq . .agents/plugins/marketplace.json >/dev/null
 jq . plugins/usage/.codex-plugin/plugin.json >/dev/null
@@ -78,20 +79,21 @@ cmp -s plugins/usage/skills/credits/scripts/show-reset-credits.sh \
 cmp -s plugins/usage/skills/keepalive/scripts/keepalive.sh \
   skills/codex-keepalive/scripts/keepalive.sh
 
-machine_path="/home/""emil"
-old_marketplace="emil""-usage"
-old_display="Emil ""Usage"
+# Keep red-flag strings encoded so this checker does not match itself.
+machine_path="$(printf '\057\150\157\155\145\057\145\155\151\154')"
+old_marketplace="$(printf '\145\155\151\154\055\165\163\141\147\145')"
+old_display="$(printf '\105\155\151\154\040\125\163\141\147\145')"
+grep_output="$(mktemp)"
+trap 'rm -f "$grep_output"' EXIT
 
 if find . \
   -path ./.git -prune -o \
   -type f -print0 \
-  | xargs -0 grep -nE "$machine_path|$old_marketplace|$old_display" >codex-skills-check-grep-output 2>/dev/null
+  | xargs -0 grep -nE "$machine_path|$old_marketplace|$old_display" >"$grep_output" 2>/dev/null
 then
-  cat codex-skills-check-grep-output >&2
-  rm -f codex-skills-check-grep-output
+  cat "$grep_output" >&2
   echo "Found machine-specific or obsolete marketplace strings." >&2
   exit 1
 fi
-rm -f codex-skills-check-grep-output
 
 echo "Package check passed."
