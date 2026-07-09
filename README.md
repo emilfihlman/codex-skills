@@ -1,6 +1,22 @@
-# Codex Skills
+# Codex Skills Plugin
 
-Personal Codex skills for usage inspection, usage forecasting, reset-credit inspection, and goal keepalive automation.
+Personal Codex plugin containing skills for usage inspection, usage forecasting, reset-credit inspection, and goal keepalive automation.
+
+## Install
+
+From this private GitHub repo:
+
+```bash
+codex plugin marketplace add emilfihlman/codex-skills --ref main
+codex plugin add codex-skills@emil-codex-skills
+```
+
+From a local checkout:
+
+```bash
+codex plugin marketplace add /path/to/codex-skills
+codex plugin add codex-skills@emil-codex-skills
+```
 
 ## Skills
 
@@ -11,6 +27,10 @@ Personal Codex skills for usage inspection, usage forecasting, reset-credit insp
 
 ## Layout
 
-Each skill lives under `skills/<skill-name>/` and is intended to be copied or installed into a Codex skills directory such as `~/.codex/skills/`.
+This repository is a Codex plugin marketplace:
+
+- `.agents/plugins/marketplace.json`: marketplace entry for the plugin.
+- `plugins/codex-skills/.codex-plugin/plugin.json`: plugin manifest.
+- `plugins/codex-skills/skills/<skill-name>/`: bundled skills.
 
 These skills call internal ChatGPT/Codex backend endpoints through the local Codex ChatGPT login. Treat endpoint failures as possible auth, rollout, or endpoint changes.

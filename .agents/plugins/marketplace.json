@@ -1,0 +1,20 @@
+{
+  "name": "emil-codex-skills",
+  "interface": {
+    "displayName": "Emil Codex Skills"
+  },
+  "plugins": [
+    {
+      "name": "codex-skills",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex-skills"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
