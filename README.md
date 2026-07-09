@@ -8,14 +8,14 @@ Install the bundled plugin when you want short names:
 
 ```bash
 codex plugin marketplace add emilfihlman/codex-skills --ref main
-codex plugin add usage@usage
+codex plugin add usage@emilfihlman
 ```
 
 Local checkout install:
 
 ```bash
 codex plugin marketplace add /path/to/codex-skills
-codex plugin add usage@usage
+codex plugin add usage@emilfihlman
 ```
 
 Plugin skills:
