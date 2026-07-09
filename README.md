@@ -11,7 +11,7 @@ codex plugin marketplace add emilfihlman/codex-skills
 codex plugin add usage@emilfihlman
 ```
 
-Both commands are needed the first time. `codex plugin marketplace add` registers this repository as a marketplace source, and `codex plugin add` installs the `usage` plugin from that marketplace. `--ref` is optional; omit it to use the repository default branch, or pass `--ref <branch-or-tag>` when you want to pin a specific branch, tag, or commit.
+Both commands are needed the first time. `codex plugin marketplace add` registers this repository as a marketplace source, and `codex plugin add` installs the `usage` plugin from that marketplace. The marketplace command also accepts an optional `--ref <branch-or-tag>` if you want to pin a specific branch, tag, or commit; omit it to use the repository default branch.
 
 Local checkout install:
 
