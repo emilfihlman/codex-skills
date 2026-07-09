@@ -7,9 +7,11 @@ Personal Codex skills for usage inspection, usage forecasting, reset-credit insp
 Install the bundled plugin when you want short names:
 
 ```bash
-codex plugin marketplace add emilfihlman/codex-skills --ref main
+codex plugin marketplace add emilfihlman/codex-skills
 codex plugin add usage@emilfihlman
 ```
+
+Both commands are needed the first time. `codex plugin marketplace add` registers this repository as a marketplace source, and `codex plugin add` installs the `usage` plugin from that marketplace. `--ref` is optional; omit it to use the repository default branch, or pass `--ref <branch-or-tag>` when you want to pin a specific branch, tag, or commit.
 
 Local checkout install:
 
