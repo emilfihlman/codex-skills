@@ -1,4 +1,7 @@
 interface:
   display_name: "Usage Keepalive"
   short_description: "Keep active goals resumable"
-  default_prompt: "Use $usage:keepalive for this active goal. Resolve this screen's target with scripts/keepalive.sh current-target, then register the goal once with scripts/keepalive.sh register <target> \"objective and checkpoint context\". Continue work normally; do not add usage-conservation behavior or manually monitor usage for this skill. The timer will observe usage exhaustion and send one /goal resume after both 5-hour and weekly usage are available again, followed by a reminder to unregister and mark the goal complete if it is already done or when it finishes. When the goal is reached or no longer needs continuation, unregister with scripts/keepalive.sh unregister <target>."
+  default_prompt: "Use $usage:keepalive to configure explicit GNU Screen resume automation for this goal."
+
+policy:
+  allow_implicit_invocation: false

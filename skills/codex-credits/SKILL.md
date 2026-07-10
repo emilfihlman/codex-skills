@@ -1,24 +1,26 @@
 ---
 name: codex-credits
-description: Query and summarize ChatGPT/Codex banked rate-limit reset credits from the local Codex ChatGPT login. Use when the user asks to check Codex usage reset tokens, reset-credit expiry times, available Codex rate-limit resets, or the internal reset-credit metadata without redeeming a token.
+description: Query and summarize banked ChatGPT/Codex rate-limit reset credits, including available count, grant status, reset type, and expiry. Use when the user asks how many reset credits exist or when they expire. Use $codex-usage instead for current 5-hour or weekly usage windows. Never redeem a credit.
 ---
 
 # Codex Credits
 
-Use this skill to inspect banked Codex rate-limit reset credits without redeeming them. The bundled script reads the local Codex auth cache, calls the ChatGPT reset-credit endpoint, and summarizes availability and expiry.
+Inspect banked reset credits without redeeming them.
 
 ## Workflow
 
-1. Run `scripts/show-reset-credits.sh` from this skill directory.
-2. If network access is blocked by sandboxing, rerun the same script with approval for network access.
-3. Report the available count, title/reset type, status, grant time, expiry time, and earliest expiry. Do not print or expose access tokens.
-4. If the user needs the complete endpoint response, run the script with `--json`. Use `--raw` only when exact unformatted JSON is needed.
+1. Run `scripts/show-reset-credits.sh`.
+2. If the sandbox blocks network access, rerun the same command with approval.
+3. Report available count, reset type, status, grant time, expiry time, and
+   earliest expiry.
+4. Use the default summary whenever possible. Treat `--json` and `--raw` as
+   sensitive full-response modes; do not repeat access tokens, account IDs,
+   user IDs, email addresses, or unrelated response fields.
+5. Never redeem a reset credit.
 
-## Script
+The helper accepts `CODEX_AUTH_FILE` and `CODEX_RESET_CREDITS_URL`. It sends
+Codex credentials only to the default ChatGPT HTTPS host unless
+`CODEX_ALLOW_UNSAFE_ENDPOINT=1` is explicitly set for controlled testing.
 
-- `scripts/show-reset-credits.sh`: uses `curl` and `jq` to query `https://chatgpt.com/backend-api/wham/rate-limit-reset-credits`.
-- Optional environment variables:
-  - `CODEX_AUTH_FILE`: path to the Codex auth JSON file. Defaults to `~/.codex/auth.json`.
-  - `CODEX_RESET_CREDITS_URL`: override endpoint URL if the internal endpoint changes.
-
-This endpoint is internal and undocumented; treat failures as possible endpoint, auth, account, or rollout changes rather than user error.
+Treat failures as possible internal-endpoint, authentication, account, or
+rollout changes rather than user error.

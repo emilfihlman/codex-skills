@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 usage() {
   cat <<'EOF'
@@ -15,9 +16,68 @@ Options:
           Show this help.
 
 Environment:
-  CODEX_AUTH_FILE   Override auth file path.
-  CODEX_USAGE_URL   Override usage endpoint URL.
+  CODEX_AUTH_FILE              Override auth file path.
+  CODEX_USAGE_URL              Override usage endpoint URL. HTTPS requests to
+                               chatgpt.com are allowed by default.
+  CODEX_ALLOW_UNSAFE_ENDPOINT  Set to 1 to allow a non-ChatGPT HTTP(S) URL for
+                               local testing. Credentials are sent to that URL.
 EOF
+}
+
+validate_endpoint() {
+  local endpoint_name="$1"
+  local url="$2"
+  local unsafe="${CODEX_ALLOW_UNSAFE_ENDPOINT:-0}"
+
+  case "$unsafe" in
+    0|1) ;;
+    *)
+      echo "CODEX_ALLOW_UNSAFE_ENDPOINT must be 0 or 1." >&2
+      exit 2
+      ;;
+  esac
+
+  if [[ "$url" == "https://chatgpt.com" || "$url" == https://chatgpt.com/* ]]; then
+    return
+  fi
+
+  if [[ "$unsafe" == "1" && "$url" =~ ^https?://[^/?#[:space:]]+([/?#].*)?$ ]]; then
+    echo "Warning: $endpoint_name points outside https://chatgpt.com; credentials will be sent to $url." >&2
+    return
+  fi
+
+  echo "$endpoint_name must use https://chatgpt.com." >&2
+  echo "For an intentional local test endpoint, set CODEX_ALLOW_UNSAFE_ENDPOINT=1 and use an HTTP(S) URL." >&2
+  exit 2
+}
+
+curl_config_escape() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '%s' "$value"
+}
+
+request_usage() {
+  local token_config account_config
+  token_config="$(curl_config_escape "$access_token")"
+  account_config="$(curl_config_escape "$account_id")"
+
+  # Read sensitive headers from curl's standard input so they are not exposed
+  # in the curl process argument list.
+  {
+    printf 'header = "Authorization: Bearer %s"\n' "$token_config"
+    printf 'header = "ChatGPT-Account-ID: %s"\n' "$account_config"
+    printf 'header = "originator: Codex Desktop"\n'
+    printf 'header = "Accept: application/json"\n'
+  } | curl -fsS \
+    --config - \
+    --connect-timeout 10 \
+    --max-time 30 \
+    --retry 2 \
+    --retry-delay 1 \
+    --retry-max-time 45 \
+    -- "$endpoint"
 }
 
 mode="summary"
@@ -39,33 +99,64 @@ done
 auth_file="${CODEX_AUTH_FILE:-$HOME/.codex/auth.json}"
 endpoint="${CODEX_USAGE_URL:-https://chatgpt.com/backend-api/wham/usage}"
 
+validate_endpoint CODEX_USAGE_URL "$endpoint"
+
 if [[ ! -r "$auth_file" ]]; then
   echo "Cannot read Codex auth file: $auth_file" >&2
   exit 1
 fi
 
-access_token="$(jq -er '.tokens.access_token // .access_token // empty' "$auth_file")"
-account_id="$(jq -er '.tokens.account_id // .account_id // empty' "$auth_file")"
-
-if [[ -z "$access_token" || -z "$account_id" ]]; then
-  echo "Codex auth file does not contain tokens.access_token and tokens.account_id." >&2
+if ! jq -e 'type == "object"' "$auth_file" >/dev/null 2>&1; then
+  echo "Codex auth file is not valid JSON object: $auth_file" >&2
   exit 1
 fi
 
-response="$(
-  curl -fsS "$endpoint" \
-    -H "Authorization: Bearer $access_token" \
-    -H "ChatGPT-Account-ID: $account_id" \
-    -H "originator: Codex Desktop" \
-    -H "Accept: application/json"
-)"
+if ! access_token="$(jq -er '(.tokens.access_token // .access_token) | select(type == "string" and length > 0)' "$auth_file")"; then
+  echo "Codex auth file is missing a non-empty access token: $auth_file" >&2
+  exit 1
+fi
+
+if ! account_id="$(jq -er '(.tokens.account_id // .account_id) | select(type == "string" and length > 0)' "$auth_file")"; then
+  echo "Codex auth file is missing a non-empty account ID: $auth_file" >&2
+  exit 1
+fi
+
+if [[ "$access_token" == *$'\n'* || "$access_token" == *$'\r'* ||
+      "$account_id" == *$'\n'* || "$account_id" == *$'\r'* ]]; then
+  echo "Codex auth credentials must not contain line breaks: $auth_file" >&2
+  exit 1
+fi
+
+response="$(request_usage)"
 
 redacted_filter='
+  def compact_window:
+    if . == null then null else {
+      used_percent,
+      limit_window_seconds,
+      reset_after_seconds,
+      reset_at
+    } end;
+
+  def compact_rate:
+    if . == null then null else {
+      allowed,
+      limit_reached,
+      primary_window: (.primary_window | compact_window),
+      secondary_window: (.secondary_window | compact_window)
+    } end;
+
   {
     plan_type,
     rate_limit_reached_type,
-    rate_limit,
-    additional_rate_limits,
+    rate_limit: (.rate_limit | compact_rate),
+    additional_rate_limits: [
+      (.additional_rate_limits // [])[] | {
+        limit_name,
+        metered_feature,
+        rate_limit: (.rate_limit | compact_rate)
+      }
+    ],
     credits: (
       if .credits == null then null else {
         has_credits: .credits.has_credits,
@@ -76,8 +167,13 @@ redacted_filter='
         approx_cloud_messages: .credits.approx_cloud_messages
       } end
     ),
-    rate_limit_reset_credits,
-    code_review_rate_limit
+    rate_limit_reset_credits: (
+      if .rate_limit_reset_credits == null then null else {
+        available_count: .rate_limit_reset_credits.available_count,
+        total_earned_count: .rate_limit_reset_credits.total_earned_count
+      } end
+    ),
+    code_review_rate_limit: (.code_review_rate_limit | compact_rate)
   }
 '
 

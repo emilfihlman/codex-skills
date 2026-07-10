@@ -1,32 +1,33 @@
 ---
 name: codex-usage
-description: Query and summarize current Codex ChatGPT-plan usage windows, including the 5-hour primary window, weekly secondary window, reset timestamps, limit-reached status, credits, and available reset credits. Use when the user asks how much Codex usage is left, whether the 5h or weekly window is near the limit, when Codex usage resets, or wants current Codex rate-limit usage from the internal ChatGPT usage endpoint.
+description: Query and summarize current Codex ChatGPT-plan usage windows, including used and remaining percentages, reset times, limit status, plan type, and usage-credit balance. Use when the user asks how much 5-hour or weekly Codex usage remains, whether a usage limit is near, or when a usage window resets. Use $codex-credits instead for banked reset-credit grants and expiry details.
 ---
 
 # Codex Usage
 
-Use this skill to inspect current Codex rate-limit windows without redeeming reset credits. The bundled script reads the local Codex ChatGPT login, calls the internal ChatGPT usage endpoint, and summarizes the active primary and secondary windows.
+Inspect current Codex rate-limit windows without redeeming reset credits.
 
 ## Workflow
 
 1. Run `scripts/show-codex-usage.sh`.
-2. If network access is blocked by sandboxing, rerun the same command with approval for network access.
-3. Report the primary window as the 5-hour window and the secondary window as the weekly window.
-4. Include used percent, approximate remaining percent, reset time, reset-after duration, limit-reached status, plan type, and available reset-credit count.
-5. Do not print or expose access tokens, account IDs, user IDs, or email addresses.
+2. If the sandbox blocks network access, rerun the same command with approval.
+3. Report the primary 5-hour and secondary weekly windows, including used and
+   remaining percentages, reset time, limit status, plan type, and usage-credit
+   balance.
+4. Route questions about banked reset-credit grants or expiry to
+   `$codex-credits`.
+5. Never print access tokens, account IDs, user IDs, or email addresses.
 
-## Script
+## Script modes
 
-- `scripts/show-codex-usage.sh`: queries `https://chatgpt.com/backend-api/wham/usage`.
-- Safe modes:
-  - default: human-readable summary
-  - `--json`: redacted structured JSON containing only usage/credit fields
-- Sensitive mode:
-  - `--raw`: exact endpoint response. Use only when needed, because it may include account identifiers.
+- Default: print a human-readable redacted summary.
+- `--json`: print redacted structured usage fields.
+- `--raw`: print the exact endpoint response. Use only when necessary and do
+  not repeat identifiers or other sensitive fields in the response.
 
-Optional environment variables:
+The helper accepts `CODEX_AUTH_FILE` and `CODEX_USAGE_URL`. It sends Codex
+credentials only to the default ChatGPT HTTPS host unless
+`CODEX_ALLOW_UNSAFE_ENDPOINT=1` is explicitly set for controlled testing.
 
-- `CODEX_AUTH_FILE`: path to the Codex auth JSON file. Defaults to `~/.codex/auth.json`.
-- `CODEX_USAGE_URL`: override endpoint URL if the internal endpoint changes.
-
-This endpoint is internal and undocumented; treat failures as possible endpoint, auth, account, or rollout changes rather than user error.
+Treat failures as possible internal-endpoint, authentication, account, or
+rollout changes rather than user error.

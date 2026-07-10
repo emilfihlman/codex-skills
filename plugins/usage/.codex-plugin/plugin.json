@@ -1,6 +1,6 @@
 {
   "name": "usage",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Codex usage inspection, usage forecasting, reset-credit inspection, and goal keepalive skills.",
   "author": {
     "name": "Emil Fihlman",
@@ -8,16 +8,21 @@
   },
   "homepage": "https://github.com/emilfihlman/codex-skills",
   "repository": "https://github.com/emilfihlman/codex-skills",
+  "license": "MIT",
   "keywords": [
     "codex",
     "usage",
+    "rate-limit",
     "forecast",
+    "credits",
     "keepalive",
+    "systemd",
+    "screen",
     "skills"
   ],
   "skills": "./skills/",
   "interface": {
-    "displayName": "Usage",
+    "displayName": "Codex Usage",
     "shortDescription": "Usage, reset-credit, forecast, and keepalive helpers for Codex.",
     "longDescription": "A small skill-only Codex plugin for checking ChatGPT-plan Codex usage, inspecting reset credits, forecasting usage exhaustion, and keeping interactive GNU Screen-backed goals resumable after usage limits clear.",
     "developerName": "Emil Fihlman",
@@ -30,7 +35,7 @@
     "defaultPrompt": [
       "Check my Codex usage.",
       "Forecast when Codex usage may run out.",
-      "Keep this Codex goal alive."
+      "Configure GNU Screen goal resume automation."
     ],
     "brandColor": "#2563EB"
   }

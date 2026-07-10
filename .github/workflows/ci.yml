@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shell dependencies
+        run: |
+          sudo apt update
+          sudo apt install --yes jq ripgrep shellcheck
+
+      - name: Validate package
+        run: scripts/check-package.sh
+
+      - name: Lint shell scripts
+        run: shellcheck --severity=warning scripts/*.sh tests/*.sh skills/*/scripts/*.sh plugins/usage/skills/*/scripts/*.sh
+
+      - name: Run isolated behavior tests
+        run: tests/run.sh

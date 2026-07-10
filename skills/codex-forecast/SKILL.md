@@ -1,49 +1,41 @@
 ---
 name: codex-forecast
-description: Forecast when Codex ChatGPT-plan usage may run out by polling backend usage from the codex-usage helper and writing readable forecast files. Use when the user asks to predict 5-hour or weekly Codex exhaustion, run a minute-by-minute usage monitor, read usage forecast state, or inspect forecast telemetry for other automation.
+description: Forecast when Codex ChatGPT-plan usage may run out by polling redacted usage data and writing readable telemetry files. Use when the user asks for usage-exhaustion predictions, a foreground poller, background forecast timer setup, or existing forecast state. Use $codex-usage for a one-time current-usage check.
 ---
 
 # Codex Forecast
 
-Use this skill for forecasting and telemetry only. Keep simple current usage checks in `$codex-usage`; use this skill when prediction, polling, or forecast files are needed. Do not use this skill to add slowdown behavior, work-style policy, mandatory waits, subagent limits, or conservation instructions unless the user explicitly asks for that separate judgment.
+Use this skill for prediction and telemetry. Do not add slowdown policies,
+mandatory waits, subagent limits, or reset-credit redemption behavior unless
+the user separately requests that judgment.
 
-## Files
-
-The monitor writes these files under `~/.codex/usage/` by default:
-
-- `codex-usage-forecast.md`: human-readable status for Codex sessions.
-- `codex-usage-forecast.json`: structured status for scripts.
-- `codex-usage-samples.jsonl`: one backend usage sample per line.
+Require `$codex-usage` alongside this skill unless `CODEX_USAGE_HELPER` points
+to another compatible redacted JSON helper.
 
 ## Commands
 
-- Query once and update forecast files:
-  `scripts/usage-monitor.sh once`
-- Start one-minute background polling through a user systemd timer:
-  `scripts/usage-monitor.sh start`
-- Check poller status:
-  `scripts/usage-monitor.sh status`
-- Stop the poller:
-  `scripts/usage-monitor.sh stop`
+- Update once: `scripts/usage-monitor.sh once`
+- Poll in the foreground: `scripts/usage-monitor.sh watch`
+- Install and enable the user-systemd timer: `scripts/usage-monitor.sh start`
+- Show timer and file status: `scripts/usage-monitor.sh status`
+- Disable the timer: `scripts/usage-monitor.sh stop`
+- Disable the timer and remove its units: `scripts/usage-monitor.sh uninstall`
 
-If network or `~/.codex` writes are blocked by sandboxing, rerun the same command with approval. The poller uses the existing `~/.codex/skills/codex-usage/scripts/show-codex-usage.sh --json` helper, so it does not print access tokens or account identifiers.
+If network or state-directory writes are blocked, rerun the same command with
+the required approval. `start` writes private unit files using the resolved
+installed script path; run it again after moving or reinstalling the skill.
 
-The systemd files live at:
+## Files and method
 
-- `~/.config/systemd/user/codex-usage-forecast.service`
-- `~/.config/systemd/user/codex-usage-forecast.timer`
+Write these private files under `~/.codex/usage/` by default:
 
-For logged-out polling, user lingering must be enabled with `loginctl enable-linger <user>`.
+- `codex-usage-forecast.md`: readable status.
+- `codex-usage-forecast.json`: structured status for automation.
+- `codex-usage-samples.jsonl`: bounded redacted sample history.
 
-## Forecast Method
+Compare recent samples from the same reset window and estimate a linear burn
+rate. Report unknown rather than claiming an outcome when reset timing or
+enough history is unavailable. Treat every prediction as rough telemetry.
 
-The forecast is intentionally simple:
-
-1. Query backend usage.
-2. Append a redacted sample to JSONL history.
-3. Compare recent samples in the same reset window.
-4. Estimate burn rate as percent per hour.
-5. Estimate exhaustion time if usage is rising.
-6. Mark whether exhaustion is predicted before the reset time.
-
-Treat predictions as rough telemetry. If there are fewer than two samples in the current reset window, report that more samples are needed. When another skill such as `$codex-keepalive` consumes the forecast, let that skill decide its own action policy.
+For logged-out polling, explain that user lingering is a separate system-level
+change and obtain confirmation before running `loginctl enable-linger`.
