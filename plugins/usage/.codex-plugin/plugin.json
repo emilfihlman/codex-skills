@@ -1,6 +1,6 @@
 {
   "name": "usage",
-  "version": "0.2.0",
+  "version": "0.2.0+codex.20260710132703",
   "description": "Codex usage inspection, usage forecasting, reset-credit inspection, and goal keepalive skills.",
   "author": {
     "name": "Emil Fihlman",

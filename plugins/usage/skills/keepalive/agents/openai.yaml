@@ -4,4 +4,4 @@ interface:
   default_prompt: "Use $usage:keepalive to configure explicit GNU Screen resume automation for this goal."
 
 policy:
-  allow_implicit_invocation: false
+  allow_implicit_invocation: true

@@ -104,7 +104,7 @@ check_skill plugins/usage/skills/keepalive keepalive '$usage:keepalive'
 
 grep -q '^policy:$' skills/codex-keepalive/agents/openai.yaml || fail "Standalone keepalive must declare invocation policy"
 grep -q '^  allow_implicit_invocation: false$' skills/codex-keepalive/agents/openai.yaml || fail "Standalone keepalive must require explicit invocation"
-grep -q '^  allow_implicit_invocation: false$' plugins/usage/skills/keepalive/agents/openai.yaml || fail "Plugin keepalive must require explicit invocation"
+grep -q '^  allow_implicit_invocation: true$' plugins/usage/skills/keepalive/agents/openai.yaml || fail "Plugin keepalive must be available in the default skill catalog"
 
 for script in scripts/*.sh tests/*.sh skills/*/scripts/*.sh plugins/usage/skills/*/scripts/*.sh; do
   check_script "$script"

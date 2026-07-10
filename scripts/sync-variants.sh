@@ -91,6 +91,7 @@ render_keepalive_yaml() {
   sed \
     -e 's/display_name: "Codex Keepalive"/display_name: "Usage Keepalive"/' \
     -e 's/\$codex-keepalive/\$usage:keepalive/g' \
+    -e 's/allow_implicit_invocation: false/allow_implicit_invocation: true/' \
     skills/codex-keepalive/agents/openai.yaml
 }
 
