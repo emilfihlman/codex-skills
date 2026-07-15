@@ -6,14 +6,14 @@ usage() {
   cat <<'EOF'
 Usage: keepalive.sh <command> [args]
 
-Sends /goal resume plus a cleanup reminder to explicitly configured GNU Screen
-sessions after Codex usage forecast says usage is ready.
+Recovers explicitly configured GNU Screen sessions after usage becomes
+available or Codex shows the stable model-capacity warning.
 
 Commands:
   configure-screen <target> <session> [window]
       Configure a named target's screen session and window.
-  register <target> [objective]
-      Keep a target's active goal resumable until it is unregistered.
+  register <target> [--mode goal|continue|both] [objective]
+      Keep a target recoverable until it is unregistered. Default mode is goal.
   unregister <target>
       Stop persistent keepalive for a target and clear any queued resume.
   set-threshold <target> <percent>
@@ -29,7 +29,8 @@ Commands:
   clear <target>
       Remove a named target's queued request.
   send-if-ready [target]
-      Send queued requests if forecast is ready. With no target, scan all targets.
+      Poll registered Screen targets and send eligible recovery requests.
+      With no target, scan all targets.
   status [target]
       Show config, queue, forecast readiness, and timer state.
   current-target [screen-session]
@@ -56,6 +57,8 @@ Environment:
                                   Default 5h threshold when a target has no override.
   CODEX_KEEPALIVE_WEEKLY_THRESHOLD_PERCENT
                                   Default weekly threshold when a target has no override.
+  CODEX_KEEPALIVE_SCREEN_TIMEOUT_SECONDS
+                                  Timeout for each Screen command. Default is 10.
   CODEX_KEEPALIVE_SYSTEMD_USER_DIR
                                   Override generated unit directory (primarily for tests).
 EOF
@@ -63,14 +66,17 @@ EOF
 
 state_dir="${CODEX_KEEPALIVE_STATE_DIR:-$HOME/.codex/keepalive}"
 forecast_json="${CODEX_USAGE_FORECAST_JSON:-$HOME/.codex/usage/codex-usage-forecast.json}"
+capacity_snapshot_dir="${_CODEX_KEEPALIVE_SNAPSHOT_DIR:-$HOME/.codex/keepalive-snapshots}"
 default_threshold_percent="${CODEX_KEEPALIVE_THRESHOLD_PERCENT:-25}"
 default_weekly_threshold_percent="${CODEX_KEEPALIVE_WEEKLY_THRESHOLD_PERCENT:-7}"
 forecast_max_age_seconds="${CODEX_KEEPALIVE_FORECAST_MAX_AGE_SECONDS:-180}"
+screen_timeout_seconds="${CODEX_KEEPALIVE_SCREEN_TIMEOUT_SECONDS:-10}"
 targets_dir="$state_dir/targets"
 service_name="codex-keepalive.service"
 timer_name="codex-keepalive.timer"
 forecast_service_name="codex-usage-forecast.service"
 systemd_user_dir="${CODEX_KEEPALIVE_SYSTEMD_USER_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user}"
+capacity_warning='⚠ Selected model is at capacity. Please try a different model.'
 script_path="$(
   cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1
   pwd -P
@@ -98,6 +104,19 @@ validate_forecast_max_age() {
     echo "CODEX_KEEPALIVE_FORECAST_MAX_AGE_SECONDS must be a positive integer." >&2
     exit 2
   fi
+}
+
+validate_screen_timeout() {
+  if [[ ! "$screen_timeout_seconds" =~ ^[0-9]+$ ]] || (( screen_timeout_seconds < 1 || screen_timeout_seconds > 60 )); then
+    echo "CODEX_KEEPALIVE_SCREEN_TIMEOUT_SECONDS must be an integer from 1 to 60." >&2
+    exit 2
+  fi
+}
+
+run_screen() {
+  need screen
+  need timeout
+  timeout --signal=TERM --kill-after=2s "${screen_timeout_seconds}s" screen "$@"
 }
 
 screen_value_ok() {
@@ -130,6 +149,15 @@ release_target_lock() {
   local fd="$1"
   flock -u "$fd" || true
   exec {fd}>&-
+}
+
+acquire_mapping_lock() {
+  local fd_var="$1" fd
+  need flock
+  mkdir -p "$state_dir"
+  exec {fd}>"$state_dir/screen-mappings.lock"
+  flock "$fd"
+  printf -v "$fd_var" '%s' "$fd"
 }
 
 atomic_write() {
@@ -213,65 +241,120 @@ bool_json() {
   esac
 }
 
+validate_delivery_mode() {
+  case "${1:-}" in
+    goal|continue|both) ;;
+    *)
+      echo "Recovery mode must be one of: goal, continue, both." >&2
+      return 2
+      ;;
+  esac
+}
+
+load_delivery_mode() {
+  local target="$1" active_json mode="goal"
+  active_json="$(active_keepalive_json "$target")"
+  if [[ -f "$active_json" ]]; then
+    if ! mode="$(jq -r '.delivery_mode // "goal"' "$active_json")"; then
+      echo "[$target] Could not read the recovery mode." >&2
+      return 1
+    fi
+  fi
+  validate_delivery_mode "$mode" || return
+  printf '%s\n' "$mode"
+}
+
 resume_reminder() {
   local target="$1"
   printf 'Keepalive reminder: you were resumed automatically for target "%s". If this goal is already finished, run "%s unregister %s" and mark the goal complete/finished again before responding. If the goal is not finished, continue normally; when it finishes, run that unregister command and mark the goal complete before the final response.' \
     "$target" "$script_path" "$target"
 }
 
-send_resume_sequence() {
-  local target="$1" screen_session="$2" screen_window="$3" log_file="$4" status=0 note
+send_terminal_message() {
+  local screen_session="$1" screen_window="$2" message="$3" label="$4" log_file="$5" state_var="$6"
+  local status=0
+  printf -v "$state_var" '%s' "uncertain"
+  if run_screen -S "$screen_session" -p "$screen_window" -X stuff "$message" >>"$log_file" 2>&1; then
+    :
+  else
+    status="$?"
+    echo "The $label injection returned status $status; delivery is uncertain and will not be retried automatically." >>"$log_file"
+    return "$status"
+  fi
+  sleep 0.1
+  if run_screen -S "$screen_session" -p "$screen_window" -X stuff $'\015' >>"$log_file" 2>&1; then
+    :
+  else
+    status="$?"
+    echo "The $label submit keystroke returned status $status; delivery is uncertain and will not be retried automatically." >>"$log_file"
+    return "$status"
+  fi
+  printf -v "$state_var" '%s' "submitted"
+}
+
+send_recovery_sequence() {
+  local target="$1" screen_session="$2" screen_window="$3" log_file="$4" mode="$5" status=0 note
+  validate_delivery_mode "$mode" || return
   note="$(resume_reminder "$target")"
   resume_delivery_state="not-attempted"
+  goal_delivery_state="not-attempted"
+  continue_delivery_state="not-attempted"
   reminder_delivery_state="not-attempted"
 
-  if screen -S "$screen_session" -p "$screen_window" -X stuff $'\015' >>"$log_file" 2>&1; then
-    :
-  else
-    status="$?"
-    echo "Resume was not attempted because the initial terminal wake-up failed." >>"$log_file"
-    return "$status"
+  if [[ "$mode" == "goal" || "$mode" == "both" ]]; then
+    if run_screen -S "$screen_session" -p "$screen_window" -X stuff $'\015' >>"$log_file" 2>&1; then
+      :
+    else
+      status="$?"
+      echo "Recovery was not attempted because the initial terminal wake-up failed." >>"$log_file"
+      return "$status"
+    fi
+    sleep 0.1
+    if send_terminal_message "$screen_session" "$screen_window" "/goal resume" "/goal resume" "$log_file" goal_delivery_state; then
+      :
+    else
+      status="$?"
+      resume_delivery_state="$goal_delivery_state"
+      return "$status"
+    fi
   fi
-  sleep 0.1
 
-  resume_delivery_state="uncertain"
-  if screen -S "$screen_session" -p "$screen_window" -X stuff "/goal resume" >>"$log_file" 2>&1; then
-    :
-  else
-    status="$?"
-    echo "The /goal resume injection returned status $status; delivery is uncertain and will not be retried automatically." >>"$log_file"
-    return "$status"
-  fi
-  sleep 0.1
-  if screen -S "$screen_session" -p "$screen_window" -X stuff $'\015' >>"$log_file" 2>&1; then
-    :
-  else
-    status="$?"
-    echo "The submit keystroke returned status $status; delivery is uncertain and will not be retried automatically." >>"$log_file"
-    return "$status"
+  if [[ "$mode" == "continue" || "$mode" == "both" ]]; then
+    if [[ "$mode" == "both" ]]; then
+      sleep 0.5
+    fi
+    if send_terminal_message "$screen_session" "$screen_window" "Continue" "Continue" "$log_file" continue_delivery_state; then
+      :
+    else
+      status="$?"
+      resume_delivery_state="$continue_delivery_state"
+      return "$status"
+    fi
   fi
   resume_delivery_state="submitted"
 
-  sleep 0.5
-  echo "----- keepalive reminder -----" >>"$log_file"
-  echo "$note" >>"$log_file"
-  if screen -S "$screen_session" -p "$screen_window" -X stuff "$note" >>"$log_file" 2>&1; then
-    :
-  else
-    reminder_delivery_state="failed"
-    echo "Reminder injection failed; /goal resume was already submitted and remains successful." >>"$log_file"
-    return 0
+  if [[ "$mode" == "goal" || "$mode" == "both" ]]; then
+    sleep 0.5
+    echo "----- keepalive reminder -----" >>"$log_file"
+    echo "$note" >>"$log_file"
+    if run_screen -S "$screen_session" -p "$screen_window" -X stuff "$note" >>"$log_file" 2>&1; then
+      :
+    else
+      reminder_delivery_state="failed"
+      echo "Reminder injection failed; recovery was already submitted and remains successful." >>"$log_file"
+      return 0
+    fi
+    reminder_delivery_state="uncertain"
+    sleep 0.1
+    if run_screen -S "$screen_session" -p "$screen_window" -X stuff $'\015' >>"$log_file" 2>&1; then
+      :
+    else
+      reminder_delivery_state="failed"
+      echo "Reminder submit failed; recovery was already submitted and remains successful." >>"$log_file"
+      return 0
+    fi
+    reminder_delivery_state="submitted"
   fi
-  reminder_delivery_state="uncertain"
-  sleep 0.1
-  if screen -S "$screen_session" -p "$screen_window" -X stuff $'\015' >>"$log_file" 2>&1; then
-    :
-  else
-    reminder_delivery_state="failed"
-    echo "Reminder submit failed; /goal resume was already submitted and remains successful." >>"$log_file"
-    return 0
-  fi
-  reminder_delivery_state="submitted"
 
   return 0
 }
@@ -362,15 +445,31 @@ configure_screen() {
     echo "Screen session and window must be non-empty and contain no control characters." >&2
     exit 2
   fi
-  local dir lock_fd
+  local dir lock_fd mapping_fd conflict status=0
   dir="$(target_dir "$target")"
   mkdir -p "$dir"
+  acquire_mapping_lock mapping_fd
   acquire_target_lock "$target" lock_fd
-  {
+  if conflict="$(find_screen_mapping_conflict "$target" "$session" "$window")"; then
+    release_target_lock "$lock_fd"
+    release_target_lock "$mapping_fd"
+    echo "Screen session '$session' window '$window' is already configured for target '$conflict'." >&2
+    return 1
+  fi
+  if {
     printf 'SCREEN_SESSION=%s\n' "$session"
     printf 'SCREEN_WINDOW=%s\n' "$window"
-  } | atomic_write "$dir/screen.env"
+  } | atomic_write "$dir/screen.env"; then
+    :
+  else
+    status="$?"
+  fi
   release_target_lock "$lock_fd"
+  release_target_lock "$mapping_fd"
+  if [[ "$status" -ne 0 ]]; then
+    echo "Could not configure target '$target'; the previous Screen mapping was preserved." >&2
+    return "$status"
+  fi
   echo "Configured target '$target': session=$session window=$window"
 }
 
@@ -395,6 +494,33 @@ load_screen_config() {
     return 1
   fi
   printf '%s\t%s\n' "$session" "$window"
+}
+
+find_screen_mapping_conflict() {
+  local target="$1" session="$2" window="$3" dir other other_config other_session other_window
+  for dir in "$targets_dir"/*; do
+    [[ -d "$dir" ]] || continue
+    other="$(basename -- "$dir")"
+    [[ "$other" != "$target" ]] || continue
+    if ! other_config="$(load_screen_config "$other" 2>/dev/null)"; then
+      continue
+    fi
+    other_session="${other_config%%$'\t'*}"
+    other_window="${other_config#*$'\t'}"
+    if [[ "$other_window" == "$window" ]] && screen_session_matches "$other_session" "$session"; then
+      printf '%s\n' "$other"
+      return 0
+    fi
+  done
+  return 1
+}
+
+ensure_unique_screen_mapping() {
+  local target="$1" session="$2" window="$3" conflict
+  if conflict="$(find_screen_mapping_conflict "$target" "$session" "$window")"; then
+    echo "[$target] Screen session '$session' window '$window' is also configured as target '$conflict'; recovery was not attempted." >&2
+    return 1
+  fi
 }
 
 queue_resume() {
@@ -538,14 +664,35 @@ register_keepalive() {
   require_target "$target"
   need jq
   shift || true
-  local objective="${*:-Resume the active Codex goal.}"
-  local dir thresholds five_hour_threshold weekly_threshold now active_json active_md screen_config tmp_json tmp_md lock_fd
+  local mode="goal"
+  if [[ "${1:-}" == "--mode" ]]; then
+    if [[ -z "${2:-}" ]]; then
+      echo "Usage: keepalive.sh register <target> [--mode goal|continue|both] [objective]" >&2
+      return 2
+    fi
+    mode="$2"
+    shift 2
+  elif [[ "${1:-}" == --mode=* ]]; then
+    mode="${1#--mode=}"
+    shift
+  fi
+  validate_delivery_mode "$mode" || return
+  local objective="${*:-Recover the active Codex work.}"
+  local dir thresholds five_hour_threshold weekly_threshold now active_json active_md screen_config tmp_json tmp_md lock_fd mapping_fd conflict
   dir="$(target_dir "$target")"
   mkdir -p "$dir"
+  acquire_mapping_lock mapping_fd
   acquire_target_lock "$target" lock_fd
   if ! screen_config="$(load_screen_config "$target")"; then
     echo "Target '$target' has no configured screen session. Run configure-screen first." >&2
     release_target_lock "$lock_fd"
+    release_target_lock "$mapping_fd"
+    return 1
+  fi
+  if conflict="$(find_screen_mapping_conflict "$target" "${screen_config%%$'\t'*}" "${screen_config#*$'\t'}")"; then
+    echo "Target '$target' duplicates the Screen mapping configured for target '$conflict'." >&2
+    release_target_lock "$lock_fd"
+    release_target_lock "$mapping_fd"
     return 1
   fi
   thresholds="$(load_thresholds "$target")"
@@ -559,6 +706,7 @@ register_keepalive() {
   jq -n \
     --arg target "$target" \
     --arg objective "$objective" \
+    --arg delivery_mode "$mode" \
     --arg cwd "$(pwd)" \
     --arg screen_session "${screen_config%%$'\t'*}" \
     --arg screen_window "${screen_config#*$'\t'}" \
@@ -571,6 +719,7 @@ register_keepalive() {
         registered_at_utc: ($registered_at_epoch | todateiso8601),
         cwd: $cwd,
         objective: $objective,
+        delivery_mode: $delivery_mode,
         screen_session: $screen_session,
         screen_window: $screen_window,
         five_hour_threshold_percent: $five_hour_threshold,
@@ -580,11 +729,21 @@ register_keepalive() {
         stop_seen_at_epoch: null,
         stop_seen_at_utc: null,
         stop_windows: [],
+        capacity_state: "armed",
+        capacity_candidate_hash: null,
+        capacity_candidate_seen_at_epoch: null,
+        capacity_candidate_seen_at_utc: null,
+        capacity_warning_latched: false,
+        capacity_stop_seen: false,
+        capacity_stop_seen_at_epoch: null,
+        capacity_stop_seen_at_utc: null,
         resume_count: 0,
+        continue_count: 0,
+        recovery_count: 0,
         last_sent_at_epoch: null,
         last_sent_at_utc: null,
         last_log_file: null,
-        rule: "observe exhausted or backend-blocked usage, then send /goal resume once after both windows are usable again"
+        rule: "recover after usage becomes available or a stable exact model-capacity warning is observed"
       }
     ' >"$tmp_json"
   {
@@ -594,9 +753,10 @@ register_keepalive() {
     echo "Registered: $(date -u -d "@$now" +%Y-%m-%dT%H:%M:%SZ)"
     echo "Cwd: $(pwd)"
     echo "Screen: ${screen_config%%$'\t'*} window ${screen_config#*$'\t'}"
+    echo "Recovery mode: $mode"
     echo "5h threshold: ${five_hour_threshold}%"
     echo "Weekly threshold: ${weekly_threshold}%"
-    echo "Rule: observe exhausted or backend-blocked usage, then send /goal resume once after both windows are usable again."
+    echo "Rule: recover after usage becomes available or a stable exact model-capacity warning is observed."
     echo
     echo "Objective:"
     echo "$objective"
@@ -605,17 +765,29 @@ register_keepalive() {
   mv -f "$tmp_json" "$active_json"
   mv -f "$tmp_md" "$active_md"
   release_target_lock "$lock_fd"
+  release_target_lock "$mapping_fd"
   echo "Registered keepalive for target '$target': $active_md"
 }
 
 unregister_keepalive() {
   local target="${1:-}"
   require_target "$target"
-  local lock_fd
+  local lock_fd mapping_fd cleanup_status=0
+  acquire_mapping_lock mapping_fd
   acquire_target_lock "$target" lock_fd
   rm -f "$(active_keepalive_json "$target")" "$(active_keepalive_md "$target")" \
     "$(target_dir "$target")/resume-request.md" "$(target_dir "$target")/resume-request.json"
+  if cleanup_capacity_snapshots "$target"; then
+    :
+  else
+    cleanup_status="$?"
+  fi
   release_target_lock "$lock_fd"
+  release_target_lock "$mapping_fd"
+  if [[ "$cleanup_status" -ne 0 ]]; then
+    echo "Unregistered keepalive for target '$target', but could not remove its private Screen snapshot artifacts." >&2
+    return "$cleanup_status"
+  fi
   echo "Unregistered keepalive for target '$target' and cleared queued resume state."
 }
 
@@ -808,6 +980,200 @@ forecast_ready() {
   ' "$forecast_json"
 }
 
+prepare_capacity_snapshot_dir() {
+  need find
+  if ! mkdir -p "$capacity_snapshot_dir" || ! chmod 700 "$capacity_snapshot_dir"; then
+    echo "Could not prepare the private Screen snapshot directory: $capacity_snapshot_dir" >&2
+    return 1
+  fi
+}
+
+cleanup_capacity_snapshots() {
+  local target="$1"
+  [[ -d "$capacity_snapshot_dir" ]] || return 0
+  need find
+  find "$capacity_snapshot_dir" -maxdepth 1 -type f \
+    -name "$target.screen-viewport.tmp.*" -delete
+}
+
+cleanup_all_capacity_snapshots() {
+  [[ -d "$capacity_snapshot_dir" ]] || return 0
+  need find
+  find "$capacity_snapshot_dir" -maxdepth 1 -type f \
+    -name '*.screen-viewport.tmp.*' -delete
+  rmdir "$capacity_snapshot_dir" 2>/dev/null || true
+}
+
+capture_capacity_observation() (
+  local target="$1" screen_session="$2" screen_window="$3"
+  local snapshot="" viewport_hash warning_present="false" status=0
+  cleanup_snapshot_on_exit() {
+    if [[ -n "$snapshot" ]]; then
+      rm -f "$snapshot" || true
+    fi
+  }
+  trap cleanup_snapshot_on_exit EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  need screen
+  need sha256sum
+  if ! prepare_capacity_snapshot_dir; then
+    return 1
+  fi
+  if ! cleanup_capacity_snapshots "$target"; then
+    echo "[$target] Could not clean a stale private Screen viewport snapshot." >&2
+    return 1
+  fi
+  if ! snapshot="$(mktemp "$capacity_snapshot_dir/$target.screen-viewport.tmp.XXXXXX")"; then
+    echo "[$target] Could not create a private Screen viewport snapshot." >&2
+    return 1
+  fi
+  if ! chmod 600 "$snapshot"; then
+    echo "[$target] Could not secure the private Screen viewport snapshot." >&2
+    return 1
+  fi
+  if run_screen -S "$screen_session" -p "$screen_window" -X hardcopy "$snapshot" >/dev/null 2>&1; then
+    :
+  else
+    status="$?"
+    echo "[$target] Could not capture Screen session '$screen_session' window '$screen_window'; model-capacity observation failed." >&2
+    return "$status"
+  fi
+  if ! viewport_hash="$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$snapshot" | sha256sum | awk '{print $1}')"; then
+    echo "[$target] Could not fingerprint the Screen viewport; model-capacity observation failed." >&2
+    return 1
+  fi
+  if sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$snapshot" \
+      | awk 'NF { line[++count] = $0 } END { start = count - 7; if (start < 1) start = 1; for (i = start; i <= count; i++) print line[i] }' \
+      | grep -Fxq -- "$capacity_warning"; then
+    warning_present="true"
+  fi
+  if ! rm -f "$snapshot"; then
+    echo "[$target] Could not remove the private Screen viewport snapshot." >&2
+    return 1
+  fi
+  snapshot=""
+  printf '%s\t%s\n' "$warning_present" "$viewport_hash"
+)
+
+observe_capacity_warning() {
+  local target="$1" dir active_json screen_config screen_session screen_window observation
+  local warning_present viewport_hash current candidate_hash latched stop_seen now tmp status
+  dir="$(target_dir "$target")"
+  active_json="$(active_keepalive_json "$target")"
+  [[ -f "$active_json" ]] || return 0
+  if ! screen_config="$(load_screen_config "$target")"; then
+    echo "[$target] Keepalive is registered, but no screen session is configured." >&2
+    return 1
+  fi
+  screen_session="${screen_config%%$'\t'*}"
+  screen_window="${screen_config#*$'\t'}"
+  ensure_unique_screen_mapping "$target" "$screen_session" "$screen_window" || return
+  if observation="$(capture_capacity_observation "$target" "$screen_session" "$screen_window")"; then
+    :
+  else
+    status="$?"
+    echo "[$target] Model-capacity monitoring is degraded for this pass (capture status $status)." >&2
+    return 70
+  fi
+  warning_present="${observation%%$'\t'*}"
+  viewport_hash="${observation#*$'\t'}"
+  if ! current="$(jq -r '[.capacity_candidate_hash // "", .capacity_warning_latched // false, .capacity_stop_seen // false] | @tsv' "$active_json")"; then
+    echo "[$target] Could not read model-capacity observation state." >&2
+    return 1
+  fi
+  candidate_hash="${current%%$'\t'*}"
+  current="${current#*$'\t'}"
+  latched="${current%%$'\t'*}"
+  stop_seen="${current#*$'\t'}"
+  now="$(date -u +%s)"
+  if ! tmp="$(mktemp "$dir/.keepalive.json.tmp.XXXXXX")"; then
+    echo "[$target] Could not create a temporary model-capacity state file." >&2
+    return 1
+  fi
+
+  if [[ "$warning_present" != "true" ]]; then
+    if [[ "$stop_seen" == "true" ]]; then
+      rm -f "$tmp"
+      echo "[$target] Confirmed model-capacity recovery remains pending after a clean Screen viewport."
+      return 0
+    fi
+    if ! jq '
+      .capacity_state = "armed"
+      | .capacity_candidate_hash = null
+      | .capacity_candidate_seen_at_epoch = null
+      | .capacity_candidate_seen_at_utc = null
+      | .capacity_warning_latched = false
+      | .capacity_stop_seen = false
+      | .capacity_stop_seen_at_epoch = null
+      | .capacity_stop_seen_at_utc = null
+    ' "$active_json" >"$tmp"; then
+      rm -f "$tmp"
+      echo "[$target] Could not prepare model-capacity rearm state; Screen was not touched." >&2
+      return 1
+    fi
+    if ! mv -f "$tmp" "$active_json"; then
+      rm -f "$tmp"
+      echo "[$target] Could not commit model-capacity rearm state; Screen was not touched." >&2
+      return 1
+    fi
+    if [[ "$latched" == "true" ]]; then
+      echo "[$target] Model-capacity recovery re-armed after a clean Screen viewport."
+    fi
+    return 0
+  fi
+
+  if [[ "$latched" == "true" ]]; then
+    rm -f "$tmp"
+    echo "[$target] Model-capacity warning remains latched; no duplicate recovery will be sent."
+    return 0
+  fi
+  if [[ -n "$candidate_hash" && "$candidate_hash" == "$viewport_hash" ]]; then
+    if ! jq --argjson now "$now" '
+      .capacity_state = "ready"
+      | .capacity_candidate_hash = null
+      | .capacity_candidate_seen_at_epoch = null
+      | .capacity_candidate_seen_at_utc = null
+      | .capacity_warning_latched = true
+      | .capacity_stop_seen = true
+      | .capacity_stop_seen_at_epoch = $now
+      | .capacity_stop_seen_at_utc = ($now | todateiso8601)
+    ' "$active_json" >"$tmp"; then
+      rm -f "$tmp"
+      echo "[$target] Could not prepare the stable model-capacity stop state; Screen was not touched." >&2
+      return 1
+    fi
+    if ! mv -f "$tmp" "$active_json"; then
+      rm -f "$tmp"
+      echo "[$target] Could not commit the stable model-capacity stop state; Screen was not touched." >&2
+      return 1
+    fi
+    echo "[$target] Confirmed a stable model-capacity stop."
+    return 0
+  fi
+
+  if ! jq --arg hash "$viewport_hash" --argjson now "$now" '
+    .capacity_state = "observing"
+    | .capacity_candidate_hash = $hash
+    | .capacity_candidate_seen_at_epoch = $now
+    | .capacity_candidate_seen_at_utc = ($now | todateiso8601)
+    | .capacity_stop_seen = false
+    | .capacity_stop_seen_at_epoch = null
+    | .capacity_stop_seen_at_utc = null
+  ' "$active_json" >"$tmp"; then
+    rm -f "$tmp"
+    echo "[$target] Could not prepare the model-capacity candidate state; Screen was not touched." >&2
+    return 1
+  fi
+  if ! mv -f "$tmp" "$active_json"; then
+    rm -f "$tmp"
+    echo "[$target] Could not commit the model-capacity candidate state; Screen was not touched." >&2
+    return 1
+  fi
+  echo "[$target] Model-capacity warning observed once; waiting for a stable second viewport."
+}
+
 mark_stop_seen_if_needed() {
   local target="$1" dir request_json now tmp
   dir="$(target_dir "$target")"
@@ -854,17 +1220,67 @@ mark_stop_seen_if_needed() {
   echo "[$target] Observed exhausted or backend-blocked usage; request will send when usage is available again."
 }
 
+one_shot_request_ready_now() {
+  local target="$1" now="$2" request_file request_json schedule require_stop_seen stop_seen send_after
+  request_file="$(target_dir "$target")/resume-request.md"
+  request_json="$(target_dir "$target")/resume-request.json"
+  [[ -f "$request_file" ]] || return 1
+  [[ -f "$request_json" ]] || return 0
+  if ! schedule="$(jq -er '
+    (.require_stop_seen // false) as $require
+    | (.stop_seen // false) as $seen
+    | (.send_after_epoch // 0) as $after
+    | if (($require | type) != "boolean")
+        or (($seen | type) != "boolean")
+        or (($after | type) != "number")
+        or ($after != ($after | floor))
+        or ($after < 0)
+      then error("invalid one-shot schedule state")
+      else [$require, $seen, $after] | @tsv
+      end
+  ' "$request_json")"; then
+    echo "[$target] Could not read one-shot schedule state; Screen was not touched." >&2
+    return 2
+  fi
+  require_stop_seen="${schedule%%$'\t'*}"
+  schedule="${schedule#*$'\t'}"
+  stop_seen="${schedule%%$'\t'*}"
+  send_after="${schedule#*$'\t'}"
+  if [[ "$require_stop_seen" == "true" ]]; then
+    [[ "$stop_seen" == "true" ]]
+  else
+    (( now >= send_after ))
+  fi
+}
+
 begin_registered_delivery() {
   local target="$1" now="$2" delivery_id="$3" log_file="$4" trigger="$5"
-  local active_json dir tmp stop_seen
+  local clear_usage="${6:-false}" clear_capacity="${7:-false}"
+  local mode="${8:-goal}"
+  local active_json dir tmp trigger_state stop_seen capacity_stop_seen candidate_hash consume_candidate="false"
   dir="$(target_dir "$target")"
   active_json="$(active_keepalive_json "$target")"
   [[ -f "$active_json" ]] || return 0
-  if ! stop_seen="$(jq -r '.stop_seen // false' "$active_json")"; then
+  if ! trigger_state="$(jq -r '[.stop_seen // false, .capacity_stop_seen // false, .capacity_candidate_hash // ""] | @tsv' "$active_json")"; then
     echo "[$target] Could not read persistent keepalive state before delivery." >&2
     return 1
   fi
-  [[ "$stop_seen" == "true" ]] || return 0
+  stop_seen="${trigger_state%%$'\t'*}"
+  trigger_state="${trigger_state#*$'\t'}"
+  capacity_stop_seen="${trigger_state%%$'\t'*}"
+  candidate_hash="${trigger_state#*$'\t'}"
+  if [[ "$clear_usage" != "true" || "$stop_seen" != "true" ]]; then
+    clear_usage="false"
+  fi
+  if [[ "$clear_capacity" != "true" || "$capacity_stop_seen" != "true" ]]; then
+    clear_capacity="false"
+  fi
+  if [[ -n "$candidate_hash" ]]; then
+    consume_candidate="true"
+  fi
+  if [[ "$clear_usage" != "true" && "$clear_capacity" != "true" && "$consume_candidate" != "true" ]]; then
+    return 0
+  fi
   if ! tmp="$(mktemp "$dir/.keepalive.json.tmp.XXXXXX")"; then
     echo "[$target] Could not create a temporary persistent delivery state file." >&2
     return 1
@@ -873,21 +1289,51 @@ begin_registered_delivery() {
     --argjson now "$now" \
     --arg delivery_id "$delivery_id" \
     --arg log_file "$log_file" \
-    --arg trigger "$trigger" '
-      .state = "armed"
-      | .last_sent_after_stop_seen_at_utc = (.stop_seen_at_utc // null)
-      | .last_sent_after_stop_windows = (.stop_windows // [])
-      | .stop_seen = false
-      | .stop_seen_at_epoch = null
-      | .stop_seen_at_utc = null
-      | .stop_windows = []
+    --arg trigger "$trigger" \
+    --arg mode "$mode" \
+    --argjson clear_usage "$clear_usage" \
+    --argjson clear_capacity "$clear_capacity" \
+    --argjson consume_candidate "$consume_candidate" '
+      (if $clear_usage then
+        .state = "armed"
+        | .last_sent_after_stop_seen_at_utc = (.stop_seen_at_utc // null)
+        | .last_sent_after_stop_windows = (.stop_windows // [])
+        | .stop_seen = false
+        | .stop_seen_at_epoch = null
+        | .stop_seen_at_utc = null
+        | .stop_windows = []
+      else . end)
+      | (if $clear_capacity then
+        .capacity_state = "latched"
+        | .last_sent_after_capacity_stop_at_utc = (.capacity_stop_seen_at_utc // null)
+        | .capacity_stop_seen = false
+        | .capacity_stop_seen_at_epoch = null
+        | .capacity_stop_seen_at_utc = null
+      else . end)
+      | (if $consume_candidate then
+        .capacity_state = "latched"
+        | .capacity_warning_latched = true
+        | .last_consumed_capacity_candidate_seen_at_utc = (.capacity_candidate_seen_at_utc // null)
+        | .capacity_candidate_hash = null
+        | .capacity_candidate_seen_at_epoch = null
+        | .capacity_candidate_seen_at_utc = null
+      else . end)
       | .last_delivery_id = $delivery_id
       | .last_delivery_trigger = $trigger
+      | .last_delivery_mode = $mode
       | .last_delivery_state = "attempting"
+      | .last_goal_delivery_state = "not-attempted"
+      | .last_continue_delivery_state = "not-attempted"
       | .last_delivery_attempt_at_epoch = $now
       | .last_delivery_attempt_at_utc = ($now | todateiso8601)
       | .last_reminder_delivery_state = "not-attempted"
-      | .resume_attempt_count = ((.resume_attempt_count // 0) + 1)
+      | .recovery_attempt_count = ((.recovery_attempt_count // 0) + 1)
+      | if ($mode == "goal" or $mode == "both") then
+          .resume_attempt_count = ((.resume_attempt_count // 0) + 1)
+        else . end
+      | if ($mode == "continue" or $mode == "both") then
+          .continue_attempt_count = ((.continue_attempt_count // 0) + 1)
+        else . end
       | .last_log_file = $log_file
     ' "$active_json" >"$tmp"; then
     rm -f "$tmp"
@@ -903,6 +1349,7 @@ begin_registered_delivery() {
 
 finish_registered_delivery() {
   local target="$1" delivery_id="$2" delivery_state="$3" reminder_state="$4" now="$5"
+  local mode="${6:-goal}" goal_state="${7:-not-attempted}" continue_state="${8:-not-attempted}"
   local active_json current_delivery_id dir tmp
   dir="$(target_dir "$target")"
   active_json="$(active_keepalive_json "$target")"
@@ -922,17 +1369,29 @@ finish_registered_delivery() {
     --argjson now "$now" \
     --arg delivery_id "$delivery_id" \
     --arg delivery_state "$delivery_state" \
-    --arg reminder_state "$reminder_state" '
+    --arg reminder_state "$reminder_state" \
+    --arg mode "$mode" \
+    --arg goal_state "$goal_state" \
+    --arg continue_state "$continue_state" '
       if .last_delivery_id != $delivery_id then .
       else
         .last_delivery_state = $delivery_state
         | .last_reminder_delivery_state = $reminder_state
+        | .last_goal_delivery_state = $goal_state
+        | .last_continue_delivery_state = $continue_state
+        | .last_delivery_mode = $mode
         | .last_delivery_completed_at_epoch = $now
         | .last_delivery_completed_at_utc = ($now | todateiso8601)
+        | if $goal_state == "submitted" then
+            .resume_count = ((.resume_count // 0) + 1)
+          else . end
+        | if $continue_state == "submitted" then
+            .continue_count = ((.continue_count // 0) + 1)
+          else . end
         | if $delivery_state == "submitted" then
             .last_sent_at_epoch = $now
             | .last_sent_at_utc = ($now | todateiso8601)
-            | .resume_count = ((.resume_count // 0) + 1)
+            | .recovery_count = ((.recovery_count // 0) + 1)
           else .
           end
       end
@@ -950,6 +1409,7 @@ finish_registered_delivery() {
 
 finish_one_shot_delivery() {
   local sent_json="$1" delivery_id="$2" delivery_state="$3" reminder_state="$4" now="$5"
+  local mode="${6:-goal}" goal_state="${7:-not-attempted}" continue_state="${8:-not-attempted}"
   local dir tmp
   [[ -f "$sent_json" ]] || return 0
   dir="$(dirname -- "$sent_json")"
@@ -961,10 +1421,16 @@ finish_one_shot_delivery() {
     --argjson now "$now" \
     --arg delivery_id "$delivery_id" \
     --arg delivery_state "$delivery_state" \
-    --arg reminder_state "$reminder_state" '
+    --arg reminder_state "$reminder_state" \
+    --arg mode "$mode" \
+    --arg goal_state "$goal_state" \
+    --arg continue_state "$continue_state" '
       .delivery_id = $delivery_id
       | .delivery_state = $delivery_state
       | .reminder_delivery_state = $reminder_state
+      | .goal_delivery_state = $goal_state
+      | .continue_delivery_state = $continue_state
+      | .delivery_mode = $mode
       | .delivery_completed_at_epoch = $now
       | .delivery_completed_at_utc = ($now | todateiso8601)
       | .automatic_retry = false
@@ -1015,7 +1481,8 @@ send_target_if_ready() {
   require_target "$target"
   need jq
   need screen
-  local dir request_file request_json screen_config screen_session screen_window ready run_id sent_file sent_json log_file status now completed_at send_after send_after_utc require_stop_seen stop_seen forecast_health_text
+  need timeout
+  local dir request_file request_json screen_config screen_session screen_window ready run_id sent_file sent_json log_file status now completed_at send_after send_after_utc require_stop_seen stop_seen forecast_health_text mode
   local finish_status=0 result retired_json=0
   dir="$(target_dir "$target")"
   request_file="$dir/resume-request.md"
@@ -1071,14 +1538,19 @@ send_target_if_ready() {
   fi
   screen_session="${screen_config%%$'\t'*}"
   screen_window="${screen_config#*$'\t'}"
+  ensure_unique_screen_mapping "$target" "$screen_session" "$screen_window" || return
+  if ! mode="$(load_delivery_mode "$target")"; then
+    return 1
+  fi
 
   run_id="$(date -u +%Y%m%dT%H%M%SZ)-$BASHPID"
   sent_file="$dir/resume-sent-$run_id.md"
   sent_json="$dir/resume-sent-$run_id.json"
   log_file="$dir/resume-$run_id.log"
   if ! {
-    echo "Sending /goal resume at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "Sending one-shot recovery at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "Target: $target"
+    echo "Recovery mode: $mode"
     echo "Usage available: true"
     echo "Request: $request_file"
     echo "Screen session: $screen_session"
@@ -1095,7 +1567,7 @@ send_target_if_ready() {
   # Retire every pending trigger before touching the terminal. If screen exits
   # ambiguously or this process dies during injection, no later timer run can
   # issue the same resume a second time.
-  if ! begin_registered_delivery "$target" "$now" "$run_id" "$log_file" "one-shot"; then
+  if ! begin_registered_delivery "$target" "$now" "$run_id" "$log_file" "one-shot-usage" true true "$mode"; then
     echo "[$target] Could not retire persistent delivery state; Screen was not touched." >&2
     return 1
   fi
@@ -1119,16 +1591,16 @@ send_target_if_ready() {
   fi
 
   set +e
-  send_resume_sequence "$target" "$screen_session" "$screen_window" "$log_file"
+  send_recovery_sequence "$target" "$screen_session" "$screen_window" "$log_file" "$mode"
   status="$?"
   set -e
   completed_at="$(date -u +%s)"
-  if finish_registered_delivery "$target" "$run_id" "$resume_delivery_state" "$reminder_delivery_state" "$completed_at"; then
+  if finish_registered_delivery "$target" "$run_id" "$resume_delivery_state" "$reminder_delivery_state" "$completed_at" "$mode" "$goal_delivery_state" "$continue_delivery_state"; then
     :
   else
     finish_status="$?"
   fi
-  if finish_one_shot_delivery "$sent_json" "$run_id" "$resume_delivery_state" "$reminder_delivery_state" "$completed_at"; then
+  if finish_one_shot_delivery "$sent_json" "$run_id" "$resume_delivery_state" "$reminder_delivery_state" "$completed_at" "$mode" "$goal_delivery_state" "$continue_delivery_state"; then
     :
   else
     result="$?"
@@ -1138,9 +1610,9 @@ send_target_if_ready() {
   fi
 
   if [[ "$status" -eq 0 && "$resume_delivery_state" == "submitted" && "$finish_status" -eq 0 ]]; then
-    echo "[$target] Sent /goal resume to screen session '$screen_session' window '$screen_window'. Log: $log_file"
+    echo "[$target] Sent $mode recovery to screen session '$screen_session' window '$screen_window'. Log: $log_file"
   else
-    echo "[$target] Resume delivery state is '$resume_delivery_state' (screen status $status). The request was retired and will not be retried automatically." >&2
+    echo "[$target] Recovery delivery state is '$resume_delivery_state' (screen status $status). The request was retired and will not be retried automatically." >&2
     if [[ "$finish_status" -ne 0 ]]; then
       echo "[$target] The terminal attempt completed, but final delivery state could not be committed." >&2
     fi
@@ -1201,12 +1673,14 @@ mark_registered_stop_seen_if_needed() {
   echo "[$target] Keepalive observed exhausted or backend-blocked usage; waiting for usage to become available."
 }
 
-send_registered_resume() {
+send_registered_recovery() {
   local target="$1"
+  local trigger="$2" clear_usage="$3" clear_capacity="$4"
   require_target "$target"
   need jq
   need screen
-  local dir active_json active_md screen_config screen_session screen_window run_id log_file status now completed_at forecast_health_text finish_status=0
+  need timeout
+  local dir active_json active_md screen_config screen_session screen_window run_id log_file status now completed_at mode finish_status=0
   dir="$(target_dir "$target")"
   active_json="$(active_keepalive_json "$target")"
   active_md="$(active_keepalive_md "$target")"
@@ -1219,18 +1693,18 @@ send_registered_resume() {
   fi
   screen_session="${screen_config%%$'\t'*}"
   screen_window="${screen_config#*$'\t'}"
-  if ! forecast_health_text="$(forecast_health)"; then
-    echo "[$target] Keepalive will not send because the forecast is not usable: $forecast_health_text"
-    return 0
+  if ! mode="$(load_delivery_mode "$target")"; then
+    return 1
   fi
 
   now="$(date -u +%s)"
   run_id="$(date -u +%Y%m%dT%H%M%SZ)-$BASHPID"
-  log_file="$dir/keepalive-resume-$run_id.log"
+  log_file="$dir/keepalive-recovery-$run_id.log"
   if ! {
-    echo "Sending persistent keepalive /goal resume at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "Sending persistent keepalive recovery at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "Target: $target"
-    echo "Usage available: true"
+    echo "Trigger: $trigger"
+    echo "Recovery mode: $mode"
     echo "Screen session: $screen_session"
     echo "Screen window: $screen_window"
     echo
@@ -1248,24 +1722,25 @@ send_registered_resume() {
 
   # Reset the observed-stop cycle before terminal injection. This is the
   # durable at-most-once boundary for persistent delivery.
-  if ! begin_registered_delivery "$target" "$now" "$run_id" "$log_file" "persistent"; then
+  if ! begin_registered_delivery "$target" "$now" "$run_id" "$log_file" "$trigger" "$clear_usage" "$clear_capacity" "$mode"; then
     echo "[$target] Could not retire persistent delivery state; Screen was not touched." >&2
     return 1
   fi
+  registered_delivery_performed=1
 
   set +e
-  send_resume_sequence "$target" "$screen_session" "$screen_window" "$log_file"
+  send_recovery_sequence "$target" "$screen_session" "$screen_window" "$log_file" "$mode"
   status="$?"
   set -e
   completed_at="$(date -u +%s)"
-  if finish_registered_delivery "$target" "$run_id" "$resume_delivery_state" "$reminder_delivery_state" "$completed_at"; then
+  if finish_registered_delivery "$target" "$run_id" "$resume_delivery_state" "$reminder_delivery_state" "$completed_at" "$mode" "$goal_delivery_state" "$continue_delivery_state"; then
     :
   else
     finish_status="$?"
   fi
 
   if [[ "$status" -ne 0 || "$resume_delivery_state" != "submitted" || "$finish_status" -ne 0 ]]; then
-    echo "[$target] Persistent resume delivery state is '$resume_delivery_state' (screen status $status). This cycle was retired and will not be retried automatically. Log: $log_file" >&2
+    echo "[$target] Persistent recovery delivery state is '$resume_delivery_state' (screen status $status). This cycle was retired and will not be retried automatically. Log: $log_file" >&2
     if [[ "$finish_status" -ne 0 ]]; then
       echo "[$target] The terminal attempt completed, but final persistent state could not be committed." >&2
     fi
@@ -1277,58 +1752,103 @@ send_registered_resume() {
     fi
     return 1
   fi
-  echo "[$target] Sent persistent keepalive /goal resume to screen session '$screen_session' window '$screen_window'. Log: $log_file"
+  echo "[$target] Sent persistent $mode recovery to screen session '$screen_session' window '$screen_window'. Log: $log_file"
 }
 
 process_registered_keepalive() {
   local target="$1"
   require_target "$target"
   need jq
-  local dir active_json ready stop_seen forecast_health_text
+  local dir active_json usage_ready="false" capacity_ready="false" stop_seen capacity_stop_seen forecast_health_text="missing forecast" forecast_usable="false" forecast_available="false" one_shot_ready="false" result trigger clear_usage="false" clear_capacity="false" now
   dir="$(target_dir "$target")"
   active_json="$(active_keepalive_json "$target")"
   if [[ ! -f "$active_json" ]]; then
     return 0
   fi
-  if [[ ! -f "$forecast_json" ]]; then
-    echo "[$target] Keepalive registered, but no forecast JSON yet: $forecast_json"
-    return 0
-  fi
-  if ! forecast_health_text="$(forecast_health)"; then
-    echo "[$target] Keepalive registered, but the forecast is not usable: $forecast_health_text"
-    return 0
-  fi
-
-  if mark_registered_stop_seen_if_needed "$target"; then
+  if observe_capacity_warning "$target"; then
     :
   else
-    return "$?"
+    result="$?"
+    if [[ "$result" -eq 70 ]]; then
+      capacity_scan_status="$result"
+    else
+      return "$result"
+    fi
   fi
-  if ! stop_seen="$(jq -r '.stop_seen // false' "$active_json")"; then
+
+  if [[ -f "$forecast_json" ]]; then
+    if forecast_health_text="$(forecast_health)"; then
+      forecast_usable="true"
+      if mark_registered_stop_seen_if_needed "$target"; then
+        :
+      else
+        result="$?"
+        return "$result"
+      fi
+    fi
+  fi
+  if ! result="$(jq -r '[.stop_seen // false, .capacity_stop_seen // false] | @tsv' "$active_json")"; then
     echo "[$target] Could not read persistent keepalive state." >&2
     return 1
   fi
-  if [[ "$stop_seen" != "true" ]]; then
-    echo "[$target] Keepalive armed; no exhausted or backend-blocked Codex usage observation yet."
-    return 0
+  stop_seen="${result%%$'\t'*}"
+  capacity_stop_seen="${result#*$'\t'}"
+  if [[ "$forecast_usable" == "true" && "$(forecast_ready)" == "true" ]]; then
+    forecast_available="true"
+  fi
+  if [[ "$stop_seen" == "true" && "$forecast_available" == "true" ]]; then
+    usage_ready="true"
+  fi
+  if [[ "$capacity_stop_seen" == "true" ]]; then
+    capacity_ready="true"
   fi
 
-  if [[ -f "$dir/resume-request.md" ]]; then
+  if [[ "$forecast_available" == "true" && -f "$dir/resume-request.md" ]]; then
+    now="$(date -u +%s)"
+    if one_shot_request_ready_now "$target" "$now"; then
+      one_shot_ready="true"
+    else
+      result="$?"
+      if [[ "$result" -gt 1 ]]; then
+        return "$result"
+      fi
+    fi
+  fi
+  if [[ "$one_shot_ready" == "true" && ( "$usage_ready" == "true" || "$capacity_ready" == "true" ) ]]; then
+    echo "[$target] Eligible one-shot request will coalesce the persistent recovery trigger for this pass."
+    usage_ready="false"
+    capacity_ready="false"
+  elif [[ "$usage_ready" == "true" && -f "$dir/resume-request.md" ]]; then
     echo "[$target] Keepalive is waiting, but a one-shot resume request exists; leaving that request in control."
+    usage_ready="false"
+  fi
+  if [[ "$usage_ready" != "true" && "$capacity_ready" != "true" ]]; then
+    if [[ "$stop_seen" == "true" ]]; then
+      echo "[$target] Keepalive observed usage exhaustion; forecast readiness: $forecast_health_text."
+    elif [[ "$forecast_usable" != "true" ]]; then
+      echo "[$target] Keepalive capacity scan completed; usage forecast is not usable: $forecast_health_text."
+    else
+      echo "[$target] Keepalive armed; no eligible recovery trigger."
+    fi
     return 0
   fi
 
-  ready="$(forecast_ready)"
-  if [[ "$ready" != "true" ]]; then
-    echo "[$target] Keepalive observed exhaustion; waiting until both 5h and weekly usage are available."
-    return 0
+  if [[ "$usage_ready" == "true" && "$capacity_ready" == "true" ]]; then
+    trigger="usage+model-capacity"
+    clear_usage="true"
+    clear_capacity="true"
+  elif [[ "$capacity_ready" == "true" ]]; then
+    trigger="model-capacity"
+    clear_capacity="true"
+  else
+    trigger="usage"
+    clear_usage="true"
   fi
-
-  send_registered_resume "$target"
+  send_registered_recovery "$target" "$trigger" "$clear_usage" "$clear_capacity"
 }
 
 process_target_if_ready() {
-  local target="$1" active_json request_file had_work=0 lock_fd status=0 result
+  local target="$1" active_json request_file had_work=0 lock_fd status=0 result registered_delivery_performed=0 capacity_scan_status=0
   require_target "$target"
   if ! acquire_target_lock "$target" lock_fd nonblocking; then
     echo "[$target] Another keepalive operation holds the target lock; skipping this timer pass."
@@ -1345,7 +1865,7 @@ process_target_if_ready() {
   else
     status="$?"
   fi
-  if [[ -f "$request_file" ]]; then
+  if [[ -f "$request_file" && "$registered_delivery_performed" -eq 0 && "$status" -eq 0 ]]; then
     if send_target_if_ready "$target"; then
       :
     else
@@ -1354,8 +1874,13 @@ process_target_if_ready() {
         status="$result"
       fi
     fi
+  elif [[ -f "$request_file" && ( "$registered_delivery_performed" -eq 1 || "$status" -ne 0 ) ]]; then
+    echo "[$target] Deferred the one-shot request because persistent processing already handled or blocked this pass."
   elif [[ "$had_work" -eq 0 ]]; then
     echo "[$target] No active keepalive or one-shot resume request."
+  fi
+  if [[ "$status" -eq 0 && "$capacity_scan_status" -ne 0 ]]; then
+    status="$capacity_scan_status"
   fi
   release_target_lock "$lock_fd"
   return "$status"
@@ -1611,7 +2136,7 @@ request_summary() {
 }
 
 active_summary() {
-  local target="$1" dir active_json objective registered state stop_seen stop_windows resume_count last_sent forecast_window forecast_end
+  local target="$1" dir active_json objective registered mode state stop_seen stop_windows capacity_state capacity_latched recovery_count resume_count continue_count last_sent last_trigger last_delivery last_goal last_continue last_reminder forecast_window forecast_end
   dir="$(target_dir "$target")"
   active_json="$(active_keepalive_json "$target")"
   if [[ ! -f "$active_json" ]]; then
@@ -1619,17 +2144,29 @@ active_summary() {
   fi
   objective="$(jq -r '.objective // "unknown"' "$active_json")"
   registered="$(jq -r '.registered_at_utc // "unknown"' "$active_json")"
+  mode="$(jq -r '.delivery_mode // "goal"' "$active_json")"
   state="$(jq -r '.state // "unknown"' "$active_json")"
   stop_seen="$(jq -r '.stop_seen // false' "$active_json")"
   stop_windows="$(jq -r '(.stop_windows // []) | if length == 0 then "none" else join(", ") end' "$active_json")"
+  capacity_state="$(jq -r '.capacity_state // "armed"' "$active_json")"
+  capacity_latched="$(jq -r '.capacity_warning_latched // false' "$active_json")"
+  recovery_count="$(jq -r '.recovery_count // .resume_count // 0' "$active_json")"
   resume_count="$(jq -r '.resume_count // 0' "$active_json")"
+  continue_count="$(jq -r '.continue_count // 0' "$active_json")"
   last_sent="$(jq -r '.last_sent_at_utc // "never"' "$active_json")"
+  last_trigger="$(jq -r '.last_delivery_trigger // "none"' "$active_json")"
+  last_delivery="$(jq -r '.last_delivery_state // "none"' "$active_json")"
+  last_goal="$(jq -r '.last_goal_delivery_state // "none"' "$active_json")"
+  last_continue="$(jq -r '.last_continue_delivery_state // "none"' "$active_json")"
+  last_reminder="$(jq -r '.last_reminder_delivery_state // "none"' "$active_json")"
   echo "  Objective: ${objective:-unknown}"
   echo "  Registered: ${registered:-unknown}"
-  echo "  State: $state"
-  echo "  Exhaustion observed: $stop_seen ($stop_windows)"
-  echo "  Rule: send once after exhausted or backend-blocked usage is observed and both windows are available"
-  echo "  Resume count: $resume_count"
+  echo "  Recovery mode: $mode"
+  echo "  Usage state: $state; exhaustion observed: $stop_seen ($stop_windows)"
+  echo "  Model-capacity state: $capacity_state; warning latched: $capacity_latched"
+  echo "  Rule: recover after usage becomes available or a stable exact model-capacity warning is observed"
+  echo "  Recovery count: $recovery_count (/goal resume: $resume_count, Continue: $continue_count)"
+  echo "  Last delivery: trigger $last_trigger; aggregate $last_delivery; goal $last_goal; Continue $last_continue; reminder $last_reminder"
   echo "  Last sent: $last_sent"
   if [[ -f "$forecast_json" ]]; then
     forecast_window="$(jq -r '
@@ -1717,10 +2254,21 @@ clear_target() {
 remove_target() {
   local target="${1:-}"
   require_target "$target"
-  local lock_fd
+  local lock_fd mapping_fd cleanup_status=0
+  acquire_mapping_lock mapping_fd
   acquire_target_lock "$target" lock_fd
   rm -rf "$(target_dir "$target")"
+  if cleanup_capacity_snapshots "$target"; then
+    :
+  else
+    cleanup_status="$?"
+  fi
   release_target_lock "$lock_fd"
+  release_target_lock "$mapping_fd"
+  if [[ "$cleanup_status" -ne 0 ]]; then
+    echo "Removed target '$target', but could not remove its private Screen snapshot artifacts." >&2
+    return "$cleanup_status"
+  fi
   echo "Removed target '$target'."
 }
 
@@ -1738,19 +2286,20 @@ systemd_quote() {
 
 install_systemd_units() {
   local service_path="$systemd_user_dir/$service_name" timer_path="$systemd_user_dir/$timer_name"
-  local quoted_script quoted_state quoted_forecast quoted_max_age quoted_five quoted_weekly
+  local quoted_script quoted_state quoted_forecast quoted_max_age quoted_screen_timeout quoted_five quoted_weekly
   quoted_script="$(systemd_quote "$script_path")"
   quoted_state="$(systemd_quote "CODEX_KEEPALIVE_STATE_DIR=$state_dir")"
   quoted_forecast="$(systemd_quote "CODEX_USAGE_FORECAST_JSON=$forecast_json")"
   quoted_max_age="$(systemd_quote "CODEX_KEEPALIVE_FORECAST_MAX_AGE_SECONDS=$forecast_max_age_seconds")"
+  quoted_screen_timeout="$(systemd_quote "CODEX_KEEPALIVE_SCREEN_TIMEOUT_SECONDS=$screen_timeout_seconds")"
   quoted_five="$(systemd_quote "CODEX_KEEPALIVE_THRESHOLD_PERCENT=$default_threshold_percent")"
   quoted_weekly="$(systemd_quote "CODEX_KEEPALIVE_WEEKLY_THRESHOLD_PERCENT=$default_weekly_threshold_percent")"
   mkdir -p "$systemd_user_dir"
   atomic_write "$service_path" <<EOF
 # Generated by $script_path. Run '$script_path uninstall' to remove.
 [Unit]
-Description=Resume registered Codex goals when fresh usage telemetry is ready
-Requires=$forecast_service_name
+Description=Recover registered Codex work after usage or model-capacity stops
+Wants=$forecast_service_name
 After=$forecast_service_name
 
 [Service]
@@ -1762,6 +2311,7 @@ ProtectSystem=full
 Environment=$quoted_state
 Environment=$quoted_forecast
 Environment=$quoted_max_age
+Environment=$quoted_screen_timeout
 Environment=$quoted_five
 Environment=$quoted_weekly
 ExecStart=:$quoted_script send-if-ready
@@ -1769,7 +2319,7 @@ EOF
   atomic_write "$timer_path" <<EOF
 # Generated by $script_path. Run '$script_path uninstall' to remove.
 [Unit]
-Description=Check registered Codex goals once per minute
+Description=Check registered Codex work once per minute
 
 [Timer]
 OnBootSec=1min
@@ -1789,10 +2339,6 @@ start_timer() {
   need systemctl
   install_systemd_units
   systemctl --user daemon-reload
-  if ! systemctl --user cat "$forecast_service_name" >/dev/null 2>&1; then
-    echo "Missing required user unit: $forecast_service_name. Install/start the forecast timer first." >&2
-    return 1
-  fi
   systemctl --user enable --now "$timer_name"
 }
 
@@ -1806,12 +2352,14 @@ uninstall_timer() {
   need systemctl
   stop_timer
   rm -f "$systemd_user_dir/$timer_name" "$systemd_user_dir/$service_name"
+  cleanup_all_capacity_snapshots
   systemctl --user daemon-reload
   systemctl --user reset-failed "$timer_name" "$service_name" >/dev/null 2>&1 || true
   echo "Removed generated keepalive user systemd units."
 }
 
 validate_forecast_max_age
+validate_screen_timeout
 cmd="${1:-status}"
 shift || true
 case "$cmd" in

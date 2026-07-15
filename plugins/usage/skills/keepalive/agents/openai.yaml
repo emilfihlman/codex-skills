@@ -1,7 +1,7 @@
 interface:
   display_name: "Usage Keepalive"
-  short_description: "Keep active goals resumable"
-  default_prompt: "Use $usage:keepalive to configure explicit GNU Screen resume automation for this goal."
+  short_description: "Recover work after usage or model capacity"
+  default_prompt: "Use $usage:keepalive to configure explicit GNU Screen recovery automation and its goal, continue, or both delivery mode."
 
 policy:
   allow_implicit_invocation: true

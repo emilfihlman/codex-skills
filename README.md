@@ -1,8 +1,8 @@
 # Codex Usage Skills
 
 Codex skills for inspecting ChatGPT-plan usage, forecasting usage exhaustion,
-checking banked reset credits, and resuming GNU Screen-backed goals after usage
-becomes available again.
+checking banked reset credits, and recovering GNU Screen-backed work after
+usage becomes available again or Codex reports model capacity.
 
 ## Important warning
 
@@ -21,7 +21,7 @@ This is an unofficial Linux-oriented tool. It does not redeem reset credits.
 | Usage and reset-credit checks | Bash, `curl`, and `jq` |
 | Forecast `once`/`watch` | Above plus GNU coreutils and `flock` |
 | Forecast background timer | Linux user systemd |
-| Keepalive | Forecast requirements plus GNU Screen |
+| Keepalive | Bash, `jq`, GNU coreutils, `flock`, and GNU Screen; usage recovery also needs forecast telemetry |
 
 Keepalive requires a dedicated GNU Screen window that continues to run Codex.
 For timers that must run while logged out, enable user lingering separately with
@@ -118,7 +118,8 @@ their installed script directories, then remove only these four skill folders:
 
 ## Background automation
 
-When working from this checkout, run forecast setup before keepalive setup:
+When usage-exhaustion recovery is wanted, run forecast setup before keepalive
+setup. Capacity-only recovery does not require forecast telemetry:
 
 ```bash
 skills/codex-forecast/scripts/usage-monitor.sh once
@@ -126,8 +127,8 @@ skills/codex-forecast/scripts/usage-monitor.sh start
 skills/codex-keepalive/scripts/keepalive.sh start
 ```
 
-For a plugin installation, ask `$usage:forecast` to run `once` and `start`,
-then explicitly ask `$usage:keepalive` to run `start`.
+For a plugin installation with usage recovery, ask `$usage:forecast` to run
+`once` and `start`, then explicitly ask `$usage:keepalive` to run `start`.
 
 `start` installs private user-systemd unit files from the running script's
 resolved path and enables the timer. `stop` disables the timer but leaves its
@@ -135,8 +136,30 @@ unit files and state. `uninstall` disables the timer and removes its unit files,
 while retaining telemetry and keepalive state.
 
 The keepalive sender only targets explicitly configured GNU Screen sessions.
-Use a dedicated Codex window, keep objectives terse and non-sensitive, and
-inspect the generated state before enabling unattended operation.
+Register with `register <target> [--mode goal|continue|both] [objective]`;
+`goal` is the default, `continue` sends the literal message `Continue`, and
+`both` sends `/goal resume` followed by `Continue`. The selected mode applies
+to both usage recovery and the exact stable warning
+`⚠ Selected model is at capacity. Please try a different model.` Continue-only
+registrations still use forecast telemetry for usage recovery, while model-
+capacity monitoring is independent of forecast state.
+
+Choose `--mode continue` for capacity-focused work that has no registered goal,
+or `--mode both` when an active goal should also be resumed. Existing and
+mode-less registrations retain the legacy `goal` behavior; re-register them to
+change mode.
+
+Capacity detection scans only private transient snapshots of the current
+viewport, never Screen scrollback. It accepts the warning only within the last
+eight nonblank viewport lines and only after two successful passes have the
+same normalized full-viewport fingerprint; timer-driven passes are normally
+one minute apart. Raw snapshots are removed immediately after inspection.
+Task-owned remnants left by forced termination or power loss are removed on a
+later capture or target cleanup. This text heuristic can miss a redrawn warning
+or mistake identical visible content for the warning. Delivery is at-most-once
+and re-arms only after a later clean viewport observation. Use a dedicated
+Codex window, keep objectives terse and non-sensitive, and inspect generated
+state before enabling unattended use.
 
 ## Repository layout
 

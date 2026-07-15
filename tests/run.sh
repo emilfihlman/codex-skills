@@ -40,6 +40,62 @@ assert_mode() {
   [[ "$actual" == "$expected" ]] || fail "$file mode is $actual, expected $expected"
 }
 
+assert_line_count() {
+  local file="$1" expected="$2" wanted="$3" actual
+  actual="$(grep -Fxc -- "$expected" "$file" || true)"
+  [[ "$actual" == "$wanted" ]] || \
+    fail "$file contains $actual exact '$expected' lines, expected $wanted"
+}
+
+assert_recovery_sequence() {
+  local file="$1"
+  shift
+  local -a actual=()
+  mapfile -t actual < <(grep -Fx -e 'TEXT /goal resume' -e 'TEXT Continue' "$file" || true)
+  [[ "${#actual[@]}" == "$#" ]] || \
+    fail "$file contains ${#actual[@]} recovery messages, expected $#"
+  local index=0 expected
+  for expected in "$@"; do
+    [[ "${actual[$index]}" == "TEXT $expected" ]] || \
+      fail "$file recovery message $((index + 1)) is '${actual[$index]}', expected 'TEXT $expected'"
+    index=$((index + 1))
+  done
+}
+
+assert_message_submitted() {
+  local file="$1" message="$2" wanted="$3" actual
+  actual="$(awk -v message="TEXT $message" '
+    previous == message && $0 == "ENTER" { count++ }
+    { previous = $0 }
+    END { print count + 0 }
+  ' "$file")"
+  [[ "$actual" == "$wanted" ]] || \
+    fail "$file submitted '$message' $actual times, expected $wanted"
+}
+
+assert_logged_paths_absent() {
+  local file="$1" path found=0
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    found=1
+    [[ ! -e "$path" ]] || fail "transient Screen snapshot remains at $path"
+  done <"$file"
+  [[ "$found" -eq 1 ]] || fail "$file contains no Screen snapshot paths"
+}
+
+assert_hardcopy_modes() {
+  local file="$1" dir_mode file_mode path found=0
+  while IFS=$'\t' read -r dir_mode file_mode path; do
+    [[ -n "$path" ]] || continue
+    found=1
+    [[ "$dir_mode" == "700" ]] || \
+      fail "Screen snapshot directory for $path had mode $dir_mode at capture time, expected 700"
+    [[ "$file_mode" == "600" ]] || \
+      fail "Screen snapshot $path had mode $file_mode at capture time, expected 600"
+  done <"$file"
+  [[ "$found" -eq 1 ]] || fail "$file contains no Screen snapshot mode observations"
+}
+
 test_api_helpers() {
   local dir="$tmp_root/api" bin="$tmp_root/api/bin"
   local auth="$dir/auth.json" args="$dir/curl.args" config="$dir/curl.config"
@@ -206,17 +262,74 @@ test_keepalive() {
   local storage_state storage_forecast storage_screen_log
   local failure_call failure_state failure_forecast failure_log failure_count expected_resumes before_resumes after_resumes failure_sent_json
   mkdir -p "$bin"
+  export _CODEX_KEEPALIVE_SNAPSHOT_DIR="$dir/snapshots"
 
   cat >"$bin/screen" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+printf '%s\n' "$*" >>"$MOCK_SCREEN_LOG"
+
+is_hardcopy=0
+previous=""
+for argument in "$@"; do
+  if [[ "$previous" == "-X" && "$argument" == "hardcopy" ]]; then
+    is_hardcopy=1
+    break
+  fi
+  previous="$argument"
+done
+if [[ "$is_hardcopy" -eq 1 ]]; then
+  hardcopy_count=0
+  if [[ -n "${MOCK_SCREEN_HARDCOPY_COUNT:-}" && -f "$MOCK_SCREEN_HARDCOPY_COUNT" ]]; then
+    hardcopy_count="$(<"$MOCK_SCREEN_HARDCOPY_COUNT")"
+  fi
+  hardcopy_count=$((hardcopy_count + 1))
+  if [[ -n "${MOCK_SCREEN_HARDCOPY_COUNT:-}" ]]; then
+    printf '%s\n' "$hardcopy_count" >"$MOCK_SCREEN_HARDCOPY_COUNT"
+  fi
+  hardcopy_path="${!#}"
+  if [[ -n "${MOCK_SCREEN_HARDCOPY_PATH_LOG:-}" ]]; then
+    printf '%s\n' "$hardcopy_path" >>"$MOCK_SCREEN_HARDCOPY_PATH_LOG"
+  fi
+  if [[ -n "${MOCK_SCREEN_HARDCOPY_MODE_LOG:-}" ]]; then
+    printf '%s\t%s\t%s\n' \
+      "$(stat -c '%a' "$(dirname -- "$hardcopy_path")")" \
+      "$(stat -c '%a' "$hardcopy_path")" \
+      "$hardcopy_path" >>"$MOCK_SCREEN_HARDCOPY_MODE_LOG"
+  fi
+  if [[ "${MOCK_SCREEN_FAIL_HARDCOPY_CALL:-0}" == "$hardcopy_count" ]]; then
+    exit 1
+  fi
+  if [[ -n "${MOCK_SCREEN_VIEWPORT:-}" ]]; then
+    cp -- "$MOCK_SCREEN_VIEWPORT" "$hardcopy_path"
+  else
+    : >"$hardcopy_path"
+  fi
+  exit 0
+fi
+
+# Count terminal delivery operations independently from hardcopy calls so the
+# existing stage-failure assertions remain stable when capture is enabled.
+if [[ -n "${MOCK_SCREEN_EVENT_LOG:-}" ]]; then
+  previous=""
+  for argument in "$@"; do
+    if [[ "$previous" == "stuff" ]]; then
+      if [[ "$argument" == $'\015' ]]; then
+        printf '%s\n' 'ENTER' >>"$MOCK_SCREEN_EVENT_LOG"
+      else
+        printf 'TEXT %s\n' "$argument" >>"$MOCK_SCREEN_EVENT_LOG"
+      fi
+      break
+    fi
+    previous="$argument"
+  done
+fi
 count=0
 if [[ -f "$MOCK_SCREEN_COUNT" ]]; then
   count="$(<"$MOCK_SCREEN_COUNT")"
 fi
 count=$((count + 1))
 printf '%s\n' "$count" >"$MOCK_SCREEN_COUNT"
-printf '%s\n' "$*" >>"$MOCK_SCREEN_LOG"
 if [[ "${MOCK_SCREEN_FAIL_CALL:-0}" == "$count" ]]; then
   exit 1
 fi
@@ -263,6 +376,21 @@ EOF
     fail "keepalive accepted '..' as a target"
   fi
   assert_contains "$dir/dotdot.err" "'.' and '..' are not allowed"
+
+  local duplicate_state="$dir/duplicate-screen-state"
+  CODEX_KEEPALIVE_STATE_DIR="$duplicate_state" \
+    "$keepalive_script" configure-screen mapone shared-screen 0 >/dev/null
+  if CODEX_KEEPALIVE_STATE_DIR="$duplicate_state" \
+      "$keepalive_script" configure-screen maptwo shared-screen 0 \
+        >"$dir/duplicate-screen.out" 2>"$dir/duplicate-screen.err"; then
+    fail "keepalive accepted duplicate Screen session/window mapping"
+  fi
+  [[ ! -f "$duplicate_state/targets/maptwo/screen.env" ]] || \
+    fail "duplicate Screen mapping was committed before rejection"
+  CODEX_KEEPALIVE_STATE_DIR="$duplicate_state" \
+    "$keepalive_script" configure-screen maptwo shared-screen 1 >/dev/null
+  assert_contains "$duplicate_state/targets/maptwo/screen.env" 'SCREEN_SESSION=shared-screen'
+  assert_contains "$duplicate_state/targets/maptwo/screen.env" 'SCREEN_WINDOW=1'
 
   write_keepalive_forecast "$forecast" false true 5 5
   write_keepalive_forecast "$ready_forecast" true false 80 80
@@ -312,7 +440,11 @@ EOF
     "$keepalive_script" register storage 'Resume storage fixture.' >/dev/null
   PATH="$bin:$PATH" CODEX_KEEPALIVE_STATE_DIR="$storage_state" CODEX_USAGE_FORECAST_JSON="$storage_forecast" \
     "$keepalive_script" queue-if-needed storage 'Resume storage fixture.' >/dev/null
-  PATH="$bin:$PATH" CODEX_KEEPALIVE_STATE_DIR="$storage_state" CODEX_USAGE_FORECAST_JSON="$storage_forecast" \
+  PATH="$bin:$PATH" \
+    CODEX_KEEPALIVE_STATE_DIR="$storage_state" \
+    CODEX_USAGE_FORECAST_JSON="$storage_forecast" \
+    MOCK_SCREEN_COUNT="$dir/storage-screen.count" \
+    MOCK_SCREEN_LOG="$storage_screen_log" \
     "$keepalive_script" send-if-ready storage >/dev/null
   write_keepalive_forecast "$storage_forecast" true false 80 80
   if PATH="$bin:$PATH" \
@@ -325,7 +457,7 @@ EOF
     fail "keepalive ignored a failed pre-send state commit"
   fi
   [[ -f "$storage_state/targets/storage/resume-request.md" ]] || fail "storage failure retired the pending request"
-  [[ ! -e "$storage_screen_log" ]] || fail "storage failure touched Screen"
+  assert_not_contains "$storage_screen_log" '-X stuff'
   assert_contains "$dir/storage-failure.err" 'Screen was not touched'
 
   for failure_call in 1 2 3; do
@@ -375,22 +507,388 @@ EOF
       fail "Screen failure call $failure_call was retried automatically"
   done
 
+  local capacity_banner='⚠ Selected model is at capacity. Please try a different model.'
+  local capacity_fixture capacity_viewport
+
+  capacity_register() {
+    local fixture="$1" target="$2" mode="$3"
+    local fixture_forecast="${4:-$fixture/missing-forecast.json}"
+    mkdir -p "$fixture"
+    : >"$fixture/screen.log"
+    : >"$fixture/events.log"
+    : >"$fixture/hardcopy-paths.log"
+    : >"$fixture/hardcopy-modes.log"
+    PATH="$bin:$PATH" \
+      CODEX_KEEPALIVE_STATE_DIR="$fixture/state" \
+      CODEX_USAGE_FORECAST_JSON="$fixture_forecast" \
+      _CODEX_KEEPALIVE_SNAPSHOT_DIR="$fixture/snapshots" \
+      "$keepalive_script" configure-screen "$target" "codex-$target" 0 >/dev/null
+    PATH="$bin:$PATH" \
+      CODEX_KEEPALIVE_STATE_DIR="$fixture/state" \
+      CODEX_USAGE_FORECAST_JSON="$fixture_forecast" \
+      _CODEX_KEEPALIVE_SNAPSHOT_DIR="$fixture/snapshots" \
+      "$keepalive_script" register "$target" --mode "$mode" "Recover $mode capacity fixture." >/dev/null
+  }
+
+  capacity_scan() {
+    local fixture="$1" target="$2" viewport="$3"
+    local fixture_forecast="${4:-$fixture/missing-forecast.json}"
+    PATH="$bin:$PATH" \
+      CODEX_KEEPALIVE_STATE_DIR="$fixture/state" \
+      CODEX_USAGE_FORECAST_JSON="$fixture_forecast" \
+      _CODEX_KEEPALIVE_SNAPSHOT_DIR="$fixture/snapshots" \
+      MOCK_SCREEN_COUNT="$fixture/delivery.count" \
+      MOCK_SCREEN_LOG="$fixture/screen.log" \
+      MOCK_SCREEN_EVENT_LOG="$fixture/events.log" \
+      MOCK_SCREEN_HARDCOPY_COUNT="$fixture/hardcopy.count" \
+      MOCK_SCREEN_HARDCOPY_PATH_LOG="$fixture/hardcopy-paths.log" \
+      MOCK_SCREEN_HARDCOPY_MODE_LOG="$fixture/hardcopy-modes.log" \
+      MOCK_SCREEN_VIEWPORT="$viewport" \
+      MOCK_SCREEN_FAIL_CALL="${CAPACITY_FAIL_DELIVERY_CALL:-0}" \
+      MOCK_SCREEN_FAIL_HARDCOPY_CALL="${CAPACITY_FAIL_HARDCOPY_CALL:-0}" \
+      MOCK_MV_FAIL_PATTERN="${CAPACITY_MV_FAIL_PATTERN:-}" \
+      "$keepalive_script" send-if-ready "$target"
+  }
+
+  capacity_fixture="$dir/capacity-continue"
+  capacity_viewport="$capacity_fixture/viewport.txt"
+  capacity_register "$capacity_fixture" capcontinue continue
+  printf 'Working output\n%s\nReady for input\n' "$capacity_banner" >"$capacity_viewport"
+
+  capacity_scan "$capacity_fixture" capcontinue "$capacity_viewport" >/dev/null
+  assert_recovery_sequence "$capacity_fixture/events.log"
+  capacity_scan "$capacity_fixture" capcontinue "$capacity_viewport" >/dev/null
+  assert_recovery_sequence "$capacity_fixture/events.log" Continue
+  assert_message_submitted "$capacity_fixture/events.log" Continue 1
+
+  capacity_scan "$capacity_fixture" capcontinue "$capacity_viewport" >/dev/null
+  assert_recovery_sequence "$capacity_fixture/events.log" Continue
+  printf '%s\n' 'Capacity warning cleared.' >"$capacity_viewport"
+  capacity_scan "$capacity_fixture" capcontinue "$capacity_viewport" >/dev/null
+  printf '%s\n' "$capacity_banner" >"$capacity_viewport"
+  capacity_scan "$capacity_fixture" capcontinue "$capacity_viewport" >/dev/null
+  assert_recovery_sequence "$capacity_fixture/events.log" Continue
+  capacity_scan "$capacity_fixture" capcontinue "$capacity_viewport" >/dev/null
+  assert_recovery_sequence "$capacity_fixture/events.log" Continue Continue
+  assert_message_submitted "$capacity_fixture/events.log" Continue 2
+  assert_not_contains "$capacity_fixture/screen.log" ' -h '
+  assert_logged_paths_absent "$capacity_fixture/hardcopy-paths.log"
+  assert_hardcopy_modes "$capacity_fixture/hardcopy-modes.log"
+  [[ ! -e "$capacity_fixture/missing-forecast.json" ]] || \
+    fail "capacity fixture unexpectedly gained usable forecast telemetry"
+
+  capacity_fixture="$dir/capacity-goal"
+  capacity_viewport="$capacity_fixture/viewport.txt"
+  capacity_register "$capacity_fixture" capgoal goal
+  printf '%s\n' "$capacity_banner" >"$capacity_viewport"
+  capacity_scan "$capacity_fixture" capgoal "$capacity_viewport" >/dev/null
+  capacity_scan "$capacity_fixture" capgoal "$capacity_viewport" >/dev/null
+  assert_recovery_sequence "$capacity_fixture/events.log" '/goal resume'
+  assert_message_submitted "$capacity_fixture/events.log" '/goal resume' 1
+  assert_line_count "$capacity_fixture/events.log" 'TEXT Continue' 0
+  assert_logged_paths_absent "$capacity_fixture/hardcopy-paths.log"
+
+  capacity_fixture="$dir/capacity-both"
+  capacity_viewport="$capacity_fixture/viewport.txt"
+  capacity_register "$capacity_fixture" capboth both
+  printf '%s\n' "$capacity_banner" >"$capacity_viewport"
+  capacity_scan "$capacity_fixture" capboth "$capacity_viewport" >/dev/null
+  capacity_scan "$capacity_fixture" capboth "$capacity_viewport" >/dev/null
+  assert_recovery_sequence "$capacity_fixture/events.log" '/goal resume' Continue
+  assert_message_submitted "$capacity_fixture/events.log" '/goal resume' 1
+  assert_message_submitted "$capacity_fixture/events.log" Continue 1
+  assert_logged_paths_absent "$capacity_fixture/hardcopy-paths.log"
+
+  capacity_fixture="$dir/capacity-one-shot-coalesce"
+  capacity_viewport="$capacity_fixture/viewport.txt"
+  local coalesce_forecast="$capacity_fixture/forecast.json"
+  capacity_register "$capacity_fixture" capcoalesce continue "$coalesce_forecast"
+  printf '%s\n' "$capacity_banner" >"$capacity_viewport"
+  capacity_scan "$capacity_fixture" capcoalesce "$capacity_viewport" "$coalesce_forecast" >/dev/null
+  write_keepalive_forecast "$coalesce_forecast" true false 80 80
+  PATH="$bin:$PATH" \
+    CODEX_KEEPALIVE_STATE_DIR="$capacity_fixture/state" \
+    CODEX_USAGE_FORECAST_JSON="$coalesce_forecast" \
+    _CODEX_KEEPALIVE_SNAPSHOT_DIR="$capacity_fixture/snapshots" \
+    "$keepalive_script" queue capcoalesce 'Coalesce this ready one-shot request.' >/dev/null
+  capacity_scan "$capacity_fixture" capcoalesce "$capacity_viewport" "$coalesce_forecast" >/dev/null
+  assert_recovery_sequence "$capacity_fixture/events.log" Continue
+  assert_message_submitted "$capacity_fixture/events.log" Continue 1
+  [[ ! -f "$capacity_fixture/state/targets/capcoalesce/resume-request.md" ]] || \
+    fail "coalesced one-shot request remained pending"
+  [[ ! -f "$capacity_fixture/state/targets/capcoalesce/resume-request.json" ]] || \
+    fail "coalesced one-shot JSON remained pending"
+  assert_jq "$capacity_fixture/state/targets/capcoalesce/keepalive.json" '
+    .stop_seen == false
+    and .capacity_stop_seen == false
+    and .capacity_warning_latched == true
+    and .last_delivery_trigger == "one-shot-usage"
+    and .last_delivery_mode == "continue"
+    and .recovery_count == 1
+    and .continue_count == 1
+  '
+  capacity_scan "$capacity_fixture" capcoalesce "$capacity_viewport" "$coalesce_forecast" >/dev/null
+  assert_recovery_sequence "$capacity_fixture/events.log" Continue
+  assert_logged_paths_absent "$capacity_fixture/hardcopy-paths.log"
+
+  capacity_fixture="$dir/capacity-pending-clean"
+  capacity_viewport="$capacity_fixture/viewport.txt"
+  capacity_register "$capacity_fixture" cappending continue
+  printf '%s\n' "$capacity_banner" >"$capacity_viewport"
+  capacity_scan "$capacity_fixture" cappending "$capacity_viewport" >/dev/null
+  local pending_state="$capacity_fixture/state/targets/cappending/keepalive.json"
+  jq '.delivery_mode = "invalid"' "$pending_state" >"$capacity_fixture/pending-state.tmp"
+  mv -f "$capacity_fixture/pending-state.tmp" "$pending_state"
+  if capacity_scan "$capacity_fixture" cappending "$capacity_viewport" \
+      >"$capacity_fixture/presend-failure.out" 2>"$capacity_fixture/presend-failure.err"; then
+    fail "invalid delivery mode did not block the pre-Screen capacity recovery"
+  fi
+  assert_recovery_sequence "$capacity_fixture/events.log"
+  assert_jq "$pending_state" '
+    .capacity_state == "ready"
+    and .capacity_stop_seen == true
+    and .capacity_warning_latched == true
+  '
+  jq '.delivery_mode = "continue"' "$pending_state" >"$capacity_fixture/pending-state.tmp"
+  mv -f "$capacity_fixture/pending-state.tmp" "$pending_state"
+  printf '%s\n' 'Capacity warning was redrawn away.' >"$capacity_viewport"
+  capacity_scan "$capacity_fixture" cappending "$capacity_viewport" >/dev/null
+  assert_recovery_sequence "$capacity_fixture/events.log" Continue
+  assert_message_submitted "$capacity_fixture/events.log" Continue 1
+  assert_jq "$pending_state" '
+    .capacity_state == "latched"
+    and .capacity_stop_seen == false
+    and .capacity_warning_latched == true
+    and .last_delivery_trigger == "model-capacity"
+  '
+  capacity_scan "$capacity_fixture" cappending "$capacity_viewport" >/dev/null
+  assert_recovery_sequence "$capacity_fixture/events.log" Continue
+  assert_jq "$pending_state" '
+    .capacity_state == "armed"
+    and .capacity_stop_seen == false
+    and .capacity_warning_latched == false
+  '
+  assert_logged_paths_absent "$capacity_fixture/hardcopy-paths.log"
+
+  capacity_fixture="$dir/usage-both"
+  capacity_viewport="$capacity_fixture/viewport.txt"
+  local usage_both_forecast="$capacity_fixture/forecast.json"
+  mkdir -p "$capacity_fixture"
+  write_keepalive_forecast "$usage_both_forecast" false true 5 5
+  capacity_register "$capacity_fixture" usageboth both "$usage_both_forecast"
+  printf '%s\n' 'No model-capacity warning is visible.' >"$capacity_viewport"
+  capacity_scan "$capacity_fixture" usageboth "$capacity_viewport" "$usage_both_forecast" >/dev/null
+  assert_recovery_sequence "$capacity_fixture/events.log"
+  write_keepalive_forecast "$usage_both_forecast" true false 80 80
+  capacity_scan "$capacity_fixture" usageboth "$capacity_viewport" "$usage_both_forecast" >/dev/null
+  assert_recovery_sequence "$capacity_fixture/events.log" '/goal resume' Continue
+  assert_message_submitted "$capacity_fixture/events.log" '/goal resume' 1
+  assert_message_submitted "$capacity_fixture/events.log" Continue 1
+  assert_logged_paths_absent "$capacity_fixture/hardcopy-paths.log"
+
+  capacity_fixture="$dir/usage-degraded-capacity"
+  capacity_viewport="$capacity_fixture/viewport.txt"
+  local degraded_forecast="$capacity_fixture/forecast.json" degraded_status
+  mkdir -p "$capacity_fixture"
+  write_keepalive_forecast "$degraded_forecast" false true 5 5
+  capacity_register "$capacity_fixture" usagedegraded continue "$degraded_forecast"
+  printf '%s\n' 'No capacity warning.' >"$capacity_viewport"
+  capacity_scan "$capacity_fixture" usagedegraded "$capacity_viewport" "$degraded_forecast" >/dev/null
+  write_keepalive_forecast "$degraded_forecast" true false 80 80
+  if CAPACITY_FAIL_HARDCOPY_CALL=2 \
+      capacity_scan "$capacity_fixture" usagedegraded "$capacity_viewport" "$degraded_forecast" \
+        >"$capacity_fixture/degraded.out" 2>"$capacity_fixture/degraded.err"; then
+    fail "usage recovery hid degraded model-capacity monitoring"
+  else
+    degraded_status="$?"
+  fi
+  [[ "$degraded_status" == "70" ]] || \
+    fail "usage recovery with degraded capacity monitoring exited $degraded_status, expected 70"
+  assert_contains "$capacity_fixture/degraded.err" 'Model-capacity monitoring is degraded'
+  assert_recovery_sequence "$capacity_fixture/events.log" Continue
+  assert_message_submitted "$capacity_fixture/events.log" Continue 1
+  assert_logged_paths_absent "$capacity_fixture/hardcopy-paths.log"
+  assert_hardcopy_modes "$capacity_fixture/hardcopy-modes.log"
+
+  capacity_scan "$capacity_fixture" usagedegraded "$capacity_viewport" "$degraded_forecast" >/dev/null
+  assert_recovery_sequence "$capacity_fixture/events.log" Continue
+  assert_message_submitted "$capacity_fixture/events.log" Continue 1
+
+  capacity_fixture="$dir/capacity-nonmatches"
+  capacity_viewport="$capacity_fixture/viewport.txt"
+  capacity_register "$capacity_fixture" capnonmatches continue
+  local -a capacity_nonmatches=(
+    "Notice: $capacity_banner"
+    "$capacity_banner Additional detail."
+    '⚠ Selected model is near capacity. Please try a different model.'
+    'Selected model is at capacity. Please try a different model.'
+  )
+  local nonmatch
+  for nonmatch in "${capacity_nonmatches[@]}"; do
+    printf '%s\n' "$nonmatch" >"$capacity_viewport"
+    capacity_scan "$capacity_fixture" capnonmatches "$capacity_viewport" >/dev/null
+    capacity_scan "$capacity_fixture" capnonmatches "$capacity_viewport" >/dev/null
+  done
+  assert_recovery_sequence "$capacity_fixture/events.log"
+  assert_logged_paths_absent "$capacity_fixture/hardcopy-paths.log"
+
+  capacity_fixture="$dir/capacity-snapshot-cleanup"
+  capacity_viewport="$capacity_fixture/viewport.txt"
+  capacity_register "$capacity_fixture" capcleanup continue
+  install -d -m 700 "$capacity_fixture/snapshots"
+  local stale_snapshot="$capacity_fixture/snapshots/capcleanup.screen-viewport.tmp.stale"
+  printf '%s\n' "$capacity_banner" >"$stale_snapshot"
+  chmod 600 "$stale_snapshot"
+  printf '%s\n' 'Clean viewport.' >"$capacity_viewport"
+  capacity_scan "$capacity_fixture" capcleanup "$capacity_viewport" >/dev/null
+  [[ ! -e "$stale_snapshot" ]] || fail "stale Screen snapshot survived the next capture"
+  assert_logged_paths_absent "$capacity_fixture/hardcopy-paths.log"
+  assert_hardcopy_modes "$capacity_fixture/hardcopy-modes.log"
+
+  stale_snapshot="$capacity_fixture/snapshots/capcleanup.screen-viewport.tmp.unregister"
+  printf '%s\n' "$capacity_banner" >"$stale_snapshot"
+  chmod 600 "$stale_snapshot"
+  PATH="$bin:$PATH" \
+    CODEX_KEEPALIVE_STATE_DIR="$capacity_fixture/state" \
+    CODEX_USAGE_FORECAST_JSON="$capacity_fixture/missing-forecast.json" \
+    _CODEX_KEEPALIVE_SNAPSHOT_DIR="$capacity_fixture/snapshots" \
+    "$keepalive_script" unregister capcleanup >/dev/null
+  [[ ! -e "$stale_snapshot" ]] || fail "target Screen snapshot survived unregister"
+  [[ -f "$capacity_fixture/state/targets/capcleanup/screen.env" ]] || \
+    fail "unregister removed the target's Screen configuration"
+
+  capacity_fixture="$dir/capacity-capture-failure"
+  capacity_viewport="$capacity_fixture/viewport.txt"
+  capacity_register "$capacity_fixture" capcapture continue
+  printf '%s\n' "$capacity_banner" >"$capacity_viewport"
+  if CAPACITY_FAIL_HARDCOPY_CALL=1 \
+      capacity_scan "$capacity_fixture" capcapture "$capacity_viewport" \
+        >"$capacity_fixture/failure.out" 2>"$capacity_fixture/failure.err"; then
+    fail "capacity monitor ignored a failed Screen snapshot"
+  fi
+  assert_recovery_sequence "$capacity_fixture/events.log"
+  assert_logged_paths_absent "$capacity_fixture/hardcopy-paths.log"
+
+  capacity_scan "$capacity_fixture" capcapture "$capacity_viewport" >/dev/null
+  assert_recovery_sequence "$capacity_fixture/events.log"
+  capacity_scan "$capacity_fixture" capcapture "$capacity_viewport" >/dev/null
+  assert_recovery_sequence "$capacity_fixture/events.log" Continue
+  assert_message_submitted "$capacity_fixture/events.log" Continue 1
+  assert_logged_paths_absent "$capacity_fixture/hardcopy-paths.log"
+
+  capacity_fixture="$dir/capacity-state-failure"
+  capacity_viewport="$capacity_fixture/viewport.txt"
+  capacity_register "$capacity_fixture" capstate continue
+  printf '%s\n' "$capacity_banner" >"$capacity_viewport"
+  capacity_scan "$capacity_fixture" capstate "$capacity_viewport" >/dev/null
+  if CAPACITY_MV_FAIL_PATTERN='.keepalive.json.tmp.' \
+      capacity_scan "$capacity_fixture" capstate "$capacity_viewport" \
+        >"$capacity_fixture/failure.out" 2>"$capacity_fixture/failure.err"; then
+    fail "capacity monitor ignored a failed pre-send state commit"
+  fi
+  assert_recovery_sequence "$capacity_fixture/events.log"
+  assert_logged_paths_absent "$capacity_fixture/hardcopy-paths.log"
+
+  capacity_scan "$capacity_fixture" capstate "$capacity_viewport" >/dev/null
+  assert_recovery_sequence "$capacity_fixture/events.log" Continue
+  assert_message_submitted "$capacity_fixture/events.log" Continue 1
+  assert_logged_paths_absent "$capacity_fixture/hardcopy-paths.log"
+
+  local continue_failure_call expected_enters before_event_lines after_event_lines
+  for continue_failure_call in 1 2; do
+    capacity_fixture="$dir/capacity-continue-failure-$continue_failure_call"
+    capacity_viewport="$capacity_fixture/viewport.txt"
+    capacity_register "$capacity_fixture" "capcontinuefail$continue_failure_call" continue
+    printf '%s\n' "$capacity_banner" >"$capacity_viewport"
+    capacity_scan "$capacity_fixture" "capcontinuefail$continue_failure_call" "$capacity_viewport" >/dev/null
+    if CAPACITY_FAIL_DELIVERY_CALL="$continue_failure_call" \
+        capacity_scan "$capacity_fixture" "capcontinuefail$continue_failure_call" "$capacity_viewport" \
+          >"$capacity_fixture/failure.out" 2>"$capacity_fixture/failure.err"; then
+      fail "capacity Continue failure on delivery call $continue_failure_call was hidden"
+    fi
+
+    expected_enters=$((continue_failure_call - 1))
+    assert_recovery_sequence "$capacity_fixture/events.log" Continue
+    assert_line_count "$capacity_fixture/events.log" 'TEXT Continue' 1
+    assert_line_count "$capacity_fixture/events.log" 'ENTER' "$expected_enters"
+    assert_jq "$capacity_fixture/state/targets/capcontinuefail$continue_failure_call/keepalive.json" '
+      .last_delivery_mode == "continue"
+      and .last_delivery_trigger == "model-capacity"
+      and .last_delivery_state == "uncertain"
+      and .last_goal_delivery_state == "not-attempted"
+      and .last_continue_delivery_state == "uncertain"
+      and .last_reminder_delivery_state == "not-attempted"
+      and .capacity_warning_latched == true
+      and .capacity_stop_seen == false
+      and .recovery_attempt_count == 1
+      and .continue_attempt_count == 1
+      and (.resume_attempt_count // 0) == 0
+      and (.recovery_count // 0) == 0
+      and (.continue_count // 0) == 0
+    '
+    before_event_lines="$(wc -l <"$capacity_fixture/events.log")"
+    capacity_scan "$capacity_fixture" "capcontinuefail$continue_failure_call" "$capacity_viewport" >/dev/null
+    after_event_lines="$(wc -l <"$capacity_fixture/events.log")"
+    [[ "$after_event_lines" == "$before_event_lines" ]] || \
+      fail "capacity Continue failure on call $continue_failure_call was retried automatically"
+    assert_logged_paths_absent "$capacity_fixture/hardcopy-paths.log"
+  done
+
+  capacity_fixture="$dir/capacity-both-continue-failure"
+  capacity_viewport="$capacity_fixture/viewport.txt"
+  capacity_register "$capacity_fixture" capbothfail both
+  printf '%s\n' "$capacity_banner" >"$capacity_viewport"
+  capacity_scan "$capacity_fixture" capbothfail "$capacity_viewport" >/dev/null
+  if CAPACITY_FAIL_DELIVERY_CALL=4 \
+      capacity_scan "$capacity_fixture" capbothfail "$capacity_viewport" \
+        >"$capacity_fixture/failure.out" 2>"$capacity_fixture/failure.err"; then
+    fail "both-mode Continue failure after /goal resume was hidden"
+  fi
+  assert_recovery_sequence "$capacity_fixture/events.log" '/goal resume' Continue
+  assert_message_submitted "$capacity_fixture/events.log" '/goal resume' 1
+  assert_message_submitted "$capacity_fixture/events.log" Continue 0
+  assert_line_count "$capacity_fixture/events.log" 'ENTER' 2
+  assert_not_contains "$capacity_fixture/events.log" 'TEXT Keepalive reminder:'
+  assert_jq "$capacity_fixture/state/targets/capbothfail/keepalive.json" '
+    .last_delivery_mode == "both"
+    and .last_delivery_trigger == "model-capacity"
+    and .last_delivery_state == "uncertain"
+    and .last_goal_delivery_state == "submitted"
+    and .last_continue_delivery_state == "uncertain"
+    and .last_reminder_delivery_state == "not-attempted"
+    and .capacity_warning_latched == true
+    and .capacity_stop_seen == false
+    and .recovery_attempt_count == 1
+    and .resume_attempt_count == 1
+    and .continue_attempt_count == 1
+    and (.recovery_count // 0) == 0
+    and .resume_count == 1
+    and (.continue_count // 0) == 0
+  '
+  before_event_lines="$(wc -l <"$capacity_fixture/events.log")"
+  capacity_scan "$capacity_fixture" capbothfail "$capacity_viewport" >/dev/null
+  after_event_lines="$(wc -l <"$capacity_fixture/events.log")"
+  [[ "$after_event_lines" == "$before_event_lines" ]] || \
+    fail "both-mode partial delivery was retried automatically"
+  assert_logged_paths_absent "$capacity_fixture/hardcopy-paths.log"
+
   export MOCK_SYSTEMCTL_LOG="$dir/systemctl.log"
   PATH="$bin:$PATH" \
     CODEX_KEEPALIVE_STATE_DIR="$state" \
     CODEX_USAGE_FORECAST_JSON="$forecast" \
     CODEX_KEEPALIVE_SYSTEMD_USER_DIR="$units" \
     "$keepalive_script" start >/dev/null
-  assert_contains "$units/codex-keepalive.service" 'Requires=codex-usage-forecast.service'
+  assert_contains "$units/codex-keepalive.service" 'Wants=codex-usage-forecast.service'
+  assert_not_contains "$units/codex-keepalive.service" 'Requires=codex-usage-forecast.service'
   assert_contains "$units/codex-keepalive.service" "ExecStart=:\"$keepalive_script\" send-if-ready"
   assert_mode "$units/codex-keepalive.service" 600
   PATH="$bin:$PATH" CODEX_KEEPALIVE_SYSTEMD_USER_DIR="$units" \
     MOCK_SYSTEMCTL_LOG="$dir/systemctl.log" "$keepalive_script" uninstall >/dev/null
   [[ ! -e "$units/codex-keepalive.service" ]] || fail "keepalive service survived uninstall"
-  pass "keepalive fails closed, reports delivery errors, remains at-most-once, and installs safely"
+  pass "keepalive recovers usage and stable capacity warnings, fails closed, and installs safely"
 }
 
-for command in bash curl jq flock stat grep find; do
+for command in bash curl jq flock stat grep find awk sha256sum install timeout; do
   command -v "$command" >/dev/null 2>&1 || fail "missing test dependency: $command"
 done
 
