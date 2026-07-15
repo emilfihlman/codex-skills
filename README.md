@@ -27,6 +27,11 @@ If you think there could be something to
 
 please open a pull request or an issue! ❤️
 
+## Getting started
+
+While the instructions below go over the project, you can also ask your LLM of choice to analyse it and give you details.
+Codex for example can do the full setup autonomously for you if you ask it to do that, which removes the need to do any manual steps.
+
 ## Important warning
 
 These skills call undocumented ChatGPT/Codex backend endpoints with the local
