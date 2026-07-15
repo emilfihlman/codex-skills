@@ -1,8 +1,31 @@
 # Codex Usage Skills
 
-Codex skills for inspecting ChatGPT-plan usage, forecasting usage exhaustion,
-checking banked reset credits, and recovering GNU Screen-backed work after
-usage becomes available again or Codex reports model capacity.
+Codex skills for inspecting ChatGPT-plan
+
+- usage,
+- forecasting usage exhaustion,
+- checking banked reset credits, and
+- recovering GNU Screen-backed work after
+  - usage becomes available again, or
+  - Codex reports model capacity issues.
+
+Do note that this almost entirely generated with Codex (ChatGPT 5.5 xhigh and 5.6-Sol ultra)
+and that this is also a new repository with low usage.
+As such before trusting this I recommend you:
+
+- Check the code
+- Have an LLM of your choice analyse it for any issues, especially security issues
+
+While I have asked GPT-5.6-Sol ultra to review this project,
+it is ultimately good to be cautious of any foreign code, especially with low usage.
+
+If you think there could be something to
+
+- update,
+- upgrade, or
+- make better,
+
+please open a pull request or an issue! ❤️
 
 ## Important warning
 
